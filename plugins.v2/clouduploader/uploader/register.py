@@ -3,6 +3,7 @@
 """
 import json
 import time as _t
+from urllib.parse import urlparse
 
 import httpx
 
@@ -108,6 +109,9 @@ def _do_register(
             detail = detail_resp.json() if detail_resp.status_code == 200 else {}
         except (ValueError, json.JSONDecodeError):
             detail = {}
+
+    _sync_movie_images_to_r2(client, movie_id, detail, print_fn)
+
     for src in detail.get("sources", []):
         if episode_id:
             if src.get("episodeId") == episode_id:
@@ -159,6 +163,73 @@ def _do_register(
 
     print_fn("   ✅ 入库完成!")
     return True
+
+
+def _sync_movie_images_to_r2(client: httpx.Client, movie_id: int, detail: dict, print_fn) -> None:
+    """下载 TMDB 影片图片到 R2，并把影片字段改成 /api/r2/images/...。"""
+    movie = detail.get("movie") or {}
+    if not isinstance(movie, dict):
+        return
+
+    targets = (
+        ("poster", "images/poster"),
+        ("backdrop", "images/backdrop"),
+        ("logo", "images/logo"),
+    )
+    updates: dict[str, str] = {}
+    s3 = None
+
+    for field, directory in targets:
+        url = str(movie.get(field) or "")
+        if not url or url.startswith("/api/r2/") or url.startswith("/r2/"):
+            continue
+        parsed = urlparse(url)
+        if parsed.hostname != "image.tmdb.org":
+            continue
+        filename = parsed.path.rstrip("/").split("/")[-1]
+        if not filename:
+            continue
+
+        key = f"{directory}/{filename}"
+        try:
+            if s3 is None:
+                s3 = get_s3_client()
+            try:
+                s3.head_object(Bucket=settings.R2_BUCKET, Key=key)
+            except Exception:
+                image = httpx.get(url, timeout=20, follow_redirects=True)
+                if image.status_code != 200 or not image.content:
+                    print_fn(f"   ⚠️ {field} 下载失败: HTTP {image.status_code}")
+                    continue
+                content_type = image.headers.get("content-type") or _content_type_for(filename)
+                s3.put_object(
+                    Bucket=settings.R2_BUCKET,
+                    Key=key,
+                    Body=image.content,
+                    ContentType=content_type,
+                )
+            updates[field] = f"/api/r2/{key}"
+        except Exception as e:
+            print_fn(f"   ⚠️ {field} 同步 R2 失败: {e}")
+
+    if not updates:
+        return
+
+    resp = client.patch(f"/api/admin/movies/{movie_id}", json=updates)
+    if resp.status_code == 200:
+        print_fn(f"   ✅ 海报资源已同步 R2: {', '.join(updates.keys())}")
+    else:
+        print_fn(f"   ⚠️ 海报字段更新失败: {resp.text[:100]}")
+
+
+def _content_type_for(filename: str) -> str:
+    suffix = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    return {
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "png": "image/png",
+        "webp": "image/webp",
+    }.get(suffix, "image/jpeg")
 
 
 def write_episode_nfo(
