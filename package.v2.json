@@ -1,0 +1,13 @@
+{
+  "CloudUploader": {
+    "name": "云端自动上传",
+    "description": "整理完成/目录监控后自动 CMAF 切片→R2上传→入库，全流程插件内闭环。FFmpeg 切片兼容 HEVC/MKV、TMDB自动回退、任务去重防重复、失败自动重试+对账兜底。",
+    "labels": "上传,R2,CMAF,自动化",
+    "version": "2.4.1",
+    "icon": "https://raw.githubusercontent.com/CNLiuBei/800-moviepilot-plugin/main/icons/upload.png",
+    "author": "cn",
+    "level": 1,
+    "v2": true,
+    "release": true
+  }
+}
