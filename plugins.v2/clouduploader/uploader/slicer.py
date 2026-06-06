@@ -65,7 +65,7 @@ def probe_video_info(input_path: str) -> dict:
     """用 ffprobe 探测源视频编码、分辨率、码率和时长。"""
     probe_stream = subprocess.run(
         [settings.FFPROBE_BIN, "-v", "quiet", "-select_streams", "v:0",
-         "-show_entries", "stream=codec_name,width,height,bit_rate",
+         "-show_entries", "stream=codec_name,width,height,bit_rate,avg_frame_rate,r_frame_rate",
          "-of", "json", input_path],
         capture_output=True, text=True, timeout=60,
     )
@@ -76,7 +76,27 @@ def probe_video_info(input_path: str) -> dict:
         capture_output=True, text=True, timeout=60,
     )
 
-    info = {"codec": "h264", "width": 1920, "height": 1080, "bitrate": 2000000, "duration": 0.0}
+    info = {
+        "codec": "h264",
+        "width": 1920,
+        "height": 1080,
+        "bitrate": 2000000,
+        "average_bitrate": 2000000,
+        "duration": 0.0,
+        "frame_rate": 0.0,
+    }
+
+    def parse_rate(value: str) -> float:
+        try:
+            if not value or value == "0/0":
+                return 0.0
+            if "/" in value:
+                num, den = value.split("/", 1)
+                den_f = float(den)
+                return float(num) / den_f if den_f else 0.0
+            return float(value)
+        except (TypeError, ValueError, ZeroDivisionError):
+            return 0.0
 
     try:
         stream_data = json.loads(probe_stream.stdout)
@@ -89,6 +109,8 @@ def probe_video_info(input_path: str) -> dict:
             stream_br = s.get("bit_rate")
             if stream_br and stream_br != "N/A":
                 info["bitrate"] = int(stream_br)
+                info["average_bitrate"] = int(stream_br)
+            info["frame_rate"] = parse_rate(s.get("avg_frame_rate") or s.get("r_frame_rate") or "")
     except (json.JSONDecodeError, ValueError, KeyError):
         pass
 
@@ -103,6 +125,7 @@ def probe_video_info(input_path: str) -> dict:
             fmt_bitrate = int(fmt_br)
             if info["bitrate"] == 2000000:
                 info["bitrate"] = fmt_bitrate
+            info["average_bitrate"] = fmt_bitrate
     except (json.JSONDecodeError, ValueError, KeyError):
         pass
 
@@ -280,6 +303,8 @@ def cmaf_demux_slice(input_path: str, output_dir: Path, print_fn=None) -> dict |
         "width": width,
         "height": height,
         "bandwidth": bitrate,
+        "averageBandwidth": probe_info.get("average_bitrate") or bitrate,
+        "frameRate": probe_info.get("frame_rate") or 0.0,
     }
 
 

@@ -237,11 +237,28 @@ def _playlist_references(playlist: Path, local_dir: Path) -> set[str]:
     return refs
 
 
+def _assert_fmp4_playlist_has_map(playlist: Path) -> None:
+    try:
+        text = playlist.read_text(encoding="utf-8", errors="ignore")
+    except OSError as e:
+        raise RuntimeError(f"播放清单读取失败: {playlist.name}: {e}") from e
+
+    media_lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    references_fmp4 = any(line.endswith(".m4s") for line in media_lines)
+    if references_fmp4 and "#EXT-X-MAP:" not in text:
+        raise RuntimeError(f"fMP4 播放清单缺少 EXT-X-MAP: {playlist.name}")
+
+
 def _verify_uploaded_hls(local_dir: Path, r2_path: str, log=print) -> None:
     """Verify key playback artifacts exist in R2 after upload."""
     required: set[str] = set()
 
     for playlist in local_dir.rglob("*.m3u8"):
+        _assert_fmp4_playlist_has_map(playlist)
         required.add(playlist.relative_to(local_dir).as_posix())
         required.update(_playlist_references(playlist, local_dir))
     for manifest in local_dir.rglob("*.mpd"):

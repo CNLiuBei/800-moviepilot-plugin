@@ -156,26 +156,31 @@ def validate_hls_media_playlists(output_dir: Path, print_fn=None) -> dict:
 
     video_playlist = output_dir / "stream-v.m3u8"
 
-    # 自动检测音频 playlist 文件名
-    audio_playlist = output_dir / "stream-a.m3u8"
-    if not audio_playlist.exists():
-        audio_playlist = output_dir / "stream-a0.m3u8"
-
     print_fn("   🔍 验证 stream-v.m3u8...")
     video_segments = validate_hls_media_playlist(video_playlist, "video")
     print_fn(f"   ✅ stream-v.m3u8: {len(video_segments)} 片段, "
              f"总时长 {sum(s['duration'] for s in video_segments):.2f}s")
 
-    print_fn(f"   🔍 验证 {audio_playlist.name}...")
-    audio_segments = validate_hls_media_playlist(audio_playlist, "audio")
-    print_fn(f"   ✅ {audio_playlist.name}: {len(audio_segments)} 片段, "
-             f"总时长 {sum(s['duration'] for s in audio_segments):.2f}s")
+    audio_playlists = sorted(output_dir.glob("stream-a*.m3u8"))
+    if not audio_playlists:
+        raise HLSValidationError("缺少音频播放列表 stream-a*.m3u8")
+
+    audio_segments = []
+    audio_target_duration = 0
+    for audio_playlist in audio_playlists:
+        print_fn(f"   🔍 验证 {audio_playlist.name}...")
+        segments = validate_hls_media_playlist(audio_playlist, "audio")
+        if not audio_segments:
+            audio_segments = segments
+        audio_target_duration = max(audio_target_duration, _extract_target_duration(audio_playlist))
+        print_fn(f"   ✅ {audio_playlist.name}: {len(segments)} 片段, "
+                 f"总时长 {sum(s['duration'] for s in segments):.2f}s")
 
     return {
         "videoSegments": video_segments,
         "audioSegments": audio_segments,
         "videoTargetDuration": _extract_target_duration(video_playlist),
-        "audioTargetDuration": _extract_target_duration(audio_playlist),
+        "audioTargetDuration": audio_target_duration,
     }
 
 
@@ -194,6 +199,8 @@ def generate_hls_master(slice_result: dict, output_dir: Path, print_fn=None, sub
     vcodec = slice_result["videoCodec"]
     acodec = slice_result["audioCodec"]
     bandwidth = slice_result["bandwidth"]
+    average_bandwidth = slice_result.get("averageBandwidth") or bandwidth
+    frame_rate = float(slice_result.get("frameRate") or 0)
     width = slice_result["width"]
     height = slice_result["height"]
     audio_tracks = slice_result.get("audioTracks", [])
@@ -219,16 +226,24 @@ def generate_hls_master(slice_result: dict, output_dir: Path, print_fn=None, sub
             lang = track["lang"]
             title = track.get("title") or _LANG_NAMES.get(lang, f"音轨 {i+1}")
             m3u8 = track["m3u8"]
+            channels = int(track.get("channels") or 2)
             is_default = "YES" if i == 0 else "NO"
             lines.append(
                 f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{_hls_attr(title)}",'
-                f'LANGUAGE="{_hls_attr(lang)}",DEFAULT={is_default},AUTOSELECT={is_default},URI="{_hls_attr(m3u8)}"'
+                f'LANGUAGE="{_hls_attr(lang)}",DEFAULT={is_default},AUTOSELECT={is_default},'
+                f'CHANNELS="{channels}",URI="{_hls_attr(m3u8)}"'
             )
         lines.append("")
     else:
         # 单音轨
         audio_m3u8 = slice_result.get("hlsAudio", "stream-a.m3u8")
-        lines.append(f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="默认音轨",DEFAULT=YES,AUTOSELECT=YES,URI="{_hls_attr(audio_m3u8)}"')
+        channels = 2
+        if audio_tracks:
+            channels = int(audio_tracks[0].get("channels") or 2)
+        lines.append(
+            f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="默认音轨",'
+            f'DEFAULT=YES,AUTOSELECT=YES,CHANNELS="{channels}",URI="{_hls_attr(audio_m3u8)}"'
+        )
         lines.append("")
 
     # 字幕轨
@@ -241,10 +256,21 @@ def generate_hls_master(slice_result: dict, output_dir: Path, print_fn=None, sub
             )
         lines.append("")
 
-    stream_inf = f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS="{vcodec},{acodec}",RESOLUTION={width}x{height},AUDIO="audio"'
+    stream_attrs = [
+        f"BANDWIDTH={int(bandwidth)}",
+        f"AVERAGE-BANDWIDTH={int(average_bandwidth)}",
+        f'CODECS="{_hls_attr(f"{vcodec},{acodec}")}"',
+        f"RESOLUTION={width}x{height}",
+    ]
+    if frame_rate > 0:
+        stream_attrs.append(f"FRAME-RATE={frame_rate:.3f}".rstrip("0").rstrip("."))
+    stream_attrs.extend([
+        'AUDIO="audio"',
+        'CLOSED-CAPTIONS="NONE"',
+    ])
     if subtitles_info:
-        stream_inf += ',SUBTITLES="subs"'
-    lines.append(stream_inf)
+        stream_attrs.append('SUBTITLES="subs"')
+    lines.append(f"#EXT-X-STREAM-INF:{','.join(stream_attrs)}")
     lines.append("stream-v.m3u8")
 
     content = "\n".join(lines) + "\n"
