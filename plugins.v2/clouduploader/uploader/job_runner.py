@@ -8,6 +8,8 @@
 - run_job 接受 params(dict) + log_fn，不再依赖 Web 任务对象
 """
 import os
+import json
+import re
 import shutil
 import subprocess
 import time
@@ -15,6 +17,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Thread
+from urllib.parse import unquote, urlparse
 
 from .runtime_config import settings
 from .parser import parse_filename
@@ -82,7 +85,7 @@ def upload_directory_smart(local_dir: Path, r2_prefix: str, on_progress, cancel_
         pass
 
     if force_overwrite and existing:
-        keys_to_delete = [f"{r2_prefix}/{rel}" for rel in existing.keys()]
+        keys_to_delete = [f"{r2_prefix}/{rel}" for rel in existing.keys() if rel != "uploading.json"]
         for i in range(0, len(keys_to_delete), 1000):
             batch = keys_to_delete[i:i + 1000]
             try:
@@ -100,6 +103,7 @@ def upload_directory_smart(local_dir: Path, r2_prefix: str, on_progress, cancel_
     total = len(files)
     total_bytes = sum(f.stat().st_size for f in files)
     uploaded_bytes = 0
+    completed_files = 0
     start_time = time.time()
 
     def upload_one(f: Path) -> tuple[str, int]:
@@ -112,32 +116,160 @@ def upload_directory_smart(local_dir: Path, r2_prefix: str, on_progress, cancel_
         s3.upload_file(str(f), settings.R2_BUCKET, key, ExtraArgs={"ContentType": ct})
         return "ok", local_size
 
-    with ThreadPoolExecutor(max_workers=settings.UPLOAD_CONCURRENCY) as pool:
-        futs = {pool.submit(upload_one, f): f for f in files}
-        for done_count, fut in enumerate(as_completed(futs), 1):
-            if cancel_check():
-                return uploaded, skipped
-            try:
-                r, size = fut.result()
-                uploaded_bytes += size
-                if r == "skip":
-                    skipped += 1
-                else:
-                    uploaded += 1
-            except Exception as e:
-                failed += 1
-                failed_file = futs[fut]
-                print(f"[upload] 失败: {failed_file.name} - {e}")
-            elapsed = time.time() - start_time
-            speed = uploaded_bytes / elapsed if elapsed > 0 else 0
-            eta = (total_bytes - uploaded_bytes) / speed if speed > 0 else 0
-            on_progress(done_count / total, speed, eta)
+    def upload_phase(phase_files: list[Path]) -> None:
+        nonlocal uploaded, skipped, failed, uploaded_bytes, completed_files
+        if not phase_files:
+            return
+        with ThreadPoolExecutor(max_workers=settings.UPLOAD_CONCURRENCY) as pool:
+            futs = {pool.submit(upload_one, f): f for f in phase_files}
+            for fut in as_completed(futs):
+                if cancel_check():
+                    return
+                try:
+                    r, size = fut.result()
+                    uploaded_bytes += size
+                    if r == "skip":
+                        skipped += 1
+                    else:
+                        uploaded += 1
+                except Exception as e:
+                    failed += 1
+                    failed_file = futs[fut]
+                    print(f"[upload] 失败: {failed_file.name} - {e}")
+                completed_files += 1
+                elapsed = time.time() - start_time
+                speed = uploaded_bytes / elapsed if elapsed > 0 else 0
+                eta = (total_bytes - uploaded_bytes) / speed if speed > 0 else 0
+                on_progress(completed_files / total, speed, eta)
+
+    def rel_name(f: Path) -> str:
+        return str(f.relative_to(local_dir)).replace("\\", "/")
+
+    media_files = [f for f in files if f.suffix.lower() not in {".m3u8", ".mpd"}]
+    child_manifests = [
+        f for f in files
+        if f.suffix.lower() in {".m3u8", ".mpd"} and rel_name(f) != "master.m3u8"
+    ]
+    master_manifests = [f for f in files if rel_name(f) == "master.m3u8"]
+
+    # Upload manifests last so clients do not see playlists before referenced media is present.
+    upload_phase(media_files)
+    if not cancel_check() and failed == 0:
+        upload_phase(child_manifests)
+    if not cancel_check() and failed == 0:
+        upload_phase(master_manifests)
 
     # 有文件上传失败：抛异常让上层 retry 重投（已成功的同尺寸文件下次会被跳过，只补失败部分）
     if failed:
         raise RuntimeError(f"{failed} 个文件上传失败（共 {total} 个），需重试补传")
 
     return uploaded, skipped
+
+
+def _put_upload_marker(r2_path: str, status: str, payload: dict | None = None, log=print) -> None:
+    """Write a small R2 marker so later reconciliation can distinguish partial uploads."""
+    try:
+        body = {
+            "status": status,
+            "updatedAt": int(time.time()),
+            **(payload or {}),
+        }
+        get_s3_client().put_object(
+            Bucket=settings.R2_BUCKET,
+            Key=f"{r2_path}/{status}.json",
+            Body=json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            ContentType="application/json",
+        )
+    except Exception as e:
+        log(f"   ⚠️ 上传标记写入失败 ({status}): {e}")
+
+
+def _delete_upload_marker(r2_path: str, status: str, log=print) -> None:
+    try:
+        get_s3_client().delete_object(Bucket=settings.R2_BUCKET, Key=f"{r2_path}/{status}.json")
+    except Exception as e:
+        log(f"   ⚠️ 上传标记清理失败 ({status}): {e}")
+
+
+def _playlist_uri_value(value: str) -> str | None:
+    value = value.strip().strip('"').strip("'")
+    if not value or value.startswith("#") or value.startswith("data:"):
+        return None
+    parsed = urlparse(value)
+    if parsed.scheme or parsed.netloc:
+        return None
+    path = unquote(parsed.path or "")
+    if not path or path.startswith("/"):
+        return None
+    return path
+
+
+def _playlist_references(playlist: Path, local_dir: Path) -> set[str]:
+    refs: set[str] = set()
+    attr_pattern = re.compile(r'\bURI=(?:"([^"]+)"|([^,\s]+))')
+    rel_parent = playlist.relative_to(local_dir).parent
+
+    try:
+        text = playlist.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return refs
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        candidates: list[str] = []
+        if line.startswith("#"):
+            candidates.extend((m.group(1) or m.group(2) or "") for m in attr_pattern.finditer(line))
+        else:
+            candidates.append(line)
+
+        for candidate in candidates:
+            uri_path = _playlist_uri_value(candidate)
+            if not uri_path:
+                continue
+            resolved = (rel_parent / uri_path).as_posix()
+            normalized = Path(resolved)
+            if ".." in normalized.parts:
+                continue
+            refs.add(normalized.as_posix())
+    return refs
+
+
+def _verify_uploaded_hls(local_dir: Path, r2_path: str, log=print) -> None:
+    """Verify key playback artifacts exist in R2 after upload."""
+    required: set[str] = set()
+
+    for playlist in local_dir.rglob("*.m3u8"):
+        required.add(playlist.relative_to(local_dir).as_posix())
+        required.update(_playlist_references(playlist, local_dir))
+    for manifest in local_dir.rglob("*.mpd"):
+        required.add(manifest.relative_to(local_dir).as_posix())
+    for init_file in local_dir.rglob("init*.mp4"):
+        required.add(init_file.relative_to(local_dir).as_posix())
+
+    # Some generated subtitle files are referenced from JSON rather than playlists.
+    for standalone_subtitle in local_dir.glob("*.vtt"):
+        required.add(standalone_subtitle.relative_to(local_dir).as_posix())
+
+    if not required:
+        raise RuntimeError("本地切片目录缺少可校验的 HLS 文件")
+
+    s3 = get_s3_client()
+    missing: list[str] = []
+    for rel in sorted(required):
+        key = f"{r2_path}/{rel}"
+        try:
+            s3.head_object(Bucket=settings.R2_BUCKET, Key=key)
+        except Exception:
+            missing.append(rel)
+
+    if missing:
+        preview = ", ".join(missing[:8])
+        more = f" 等 {len(missing)} 个" if len(missing) > 8 else ""
+        raise RuntimeError(f"R2 上传完整性校验失败: {preview}{more}")
+    log(f"   ✅ R2 完整性校验通过: {len(required)} 个关键文件")
 
 
 def _is_empty_real_dir(path: str) -> bool:
@@ -276,6 +408,7 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
         subtitles = []
         subtitles_info = None  # HLS WebVTT 字幕轨信息
         video_duration = None  # 视频时长（秒），切片后填充，用于更新分集时长
+        upload_verified = False
         if not params.get("no_subtitles"):
             if cancel_check():
                 return {"status": "cancelled", "error": None, "r2_path": r2_path}
@@ -362,6 +495,7 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
             force_overwrite = params.get("force_overwrite", False)
             log("📤 强制重新上传 R2 (覆盖旧数据)..." if force_overwrite else "📤 上传 R2 (检查重复)...")
             start = time.time()
+            _put_upload_marker(r2_path, "uploading", {"file": Path(filepath).name}, log)
 
             upload_last_log = [0]
 
@@ -387,6 +521,18 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
             if not ok_up:
                 return _fail("upload", "R2 上传失败", r2_path)
             log(f"   ✅ 新上传 {up_res['uploaded']}, 跳过 {up_res['skipped']} (已存在), {time.time()-start:.1f}s")
+
+            try:
+                _verify_uploaded_hls(local_output, r2_path, log)
+            except Exception as e:
+                return _fail("verify", str(e), r2_path)
+            upload_verified = True
+        elif local_output and local_output.exists():
+            try:
+                _verify_uploaded_hls(local_output, r2_path, log)
+            except Exception as e:
+                return _fail("verify", str(e), r2_path)
+            upload_verified = True
 
         # ─── NFO ───
         log("📋 写 NFO...")
@@ -429,6 +575,12 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
                 # 切片和上传已成功，仅入库失败：保留 R2 数据，标记失败便于对账补入库
                 log("❌ 入库失败（R2 数据已上传，将由对账兜底重试）")
                 return {"status": "error", "error": "站点入库失败", "r2_path": r2_path, "stage": "register"}
+
+        if upload_verified:
+            _put_upload_marker(r2_path, "ready", {"file": Path(filepath).name}, log)
+            _delete_upload_marker(r2_path, "uploading", log)
+        else:
+            log("   ⚠️ 未执行上传校验，跳过 ready.json 标记")
 
         log("━━━ 完成 ━━━")
         notify_upload_success(

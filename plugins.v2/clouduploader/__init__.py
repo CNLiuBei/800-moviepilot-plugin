@@ -73,6 +73,7 @@ class CloudUploader(_PluginBase):
     # 事件防抖：dedup_key -> 上次受理时间戳，避免 MoviePilot 对同一文件重复派发事件
     _recent_events: Dict[str, float] = {}
     _EVENT_DEBOUNCE_SECONDS = 120  # 同一集在该时间窗内的重复事件直接忽略
+    _UPLOAD_MARKER_STALE_SECONDS = 6 * 3600  # R2 uploading.json 超过该时间视为半成品
     # 目录监控：path -> debounce timer
     _watch_observer = None
     _watch_timers: Dict[str, threading.Timer] = {}
@@ -732,6 +733,7 @@ class CloudUploader(_PluginBase):
         skipped_no_history = 0
         skipped_r2_exists = 0
         skipped_inflight = 0
+        skipped_uploading = 0
 
         for filepath in media_files:
             try:
@@ -746,6 +748,8 @@ class CloudUploader(_PluginBase):
                     skipped_r2_exists += 1
                 elif result == "inflight":
                     skipped_inflight += 1
+                elif result == "uploading":
+                    skipped_uploading += 1
             except Exception as e:
                 logger.warning(f"[CloudUploader] 扫描文件异常 {filepath}: {e}")
 
@@ -754,7 +758,7 @@ class CloudUploader(_PluginBase):
             f"[CloudUploader] 扫描完成 ({elapsed:.1f}s): "
             f"补传入队 {queued}, R2已存在 {skipped_r2_exists}, "
             f"任务已成功 {skipped_success}, 已在队列 {skipped_inflight}, "
-            f"无整理记录 {skipped_no_history}"
+            f"上传中 {skipped_uploading}, 无整理记录 {skipped_no_history}"
         )
         if queued > 0 and self._notify:
             self._mp_notify("【云端上传】目录扫描补传", f"发现 {queued} 个未上传文件，已入队")
@@ -769,6 +773,7 @@ class CloudUploader(_PluginBase):
             "no_history" - MP 整理历史中找不到该文件，跳过
             "r2_exists"  - R2 上已有对应播放清单，跳过
             "inflight"   - 已在队列/执行中，跳过
+            "uploading"   - R2 上存在较新的 uploading.json，暂不补传
             "queued"     - 已入队补传
         """
         # 3a. 查 TransferHistory，按 dest 路径精确匹配
@@ -804,31 +809,46 @@ class CloudUploader(_PluginBase):
         if tasks.get(task_key, {}).get("status") == "success":
             return "success"
 
-        # 3c. 检查 R2 是否已有播放清单
+        # 3c. 检查 R2 标记/播放清单
         if season and episode:
             r2_path = f"videos/800-{tmdb_id}/S{int(season):02d}/E{int(episode):02d}"
         else:
             r2_path = f"videos/800-{tmdb_id}"
 
+        force_overwrite = False
         try:
             from .uploader.r2 import get_s3_client
             s3 = get_s3_client()
-            exists_key = None
-            for playlist in ("master.m3u8", "stream.m3u8"):
-                try:
-                    s3.head_object(Bucket=settings.R2_BUCKET, Key=f"{r2_path}/{playlist}")
-                    exists_key = playlist
-                    break
-                except Exception:
-                    continue
-            if not exists_key:
-                raise FileNotFoundError(f"{r2_path}/master.m3u8")
-            # 存在则记录为成功，避免下次重复检查
-            self._record_task(task_key, {
-                "filepath": filepath, "tmdb_id": tmdb_id,
-                "media_type": media_type, "season": season, "episode": episode,
-            }, "success", stage=f"r2_exists:{exists_key}")
-            return "r2_exists"
+            marker_state = self._r2_upload_marker_state(s3, r2_path)
+            if marker_state == "ready":
+                self._record_task(task_key, {
+                    "filepath": filepath, "tmdb_id": tmdb_id,
+                    "media_type": media_type, "season": season, "episode": episode,
+                }, "success", stage="r2_ready")
+                return "r2_exists"
+            if marker_state == "uploading":
+                return "uploading"
+            if marker_state == "stale_uploading":
+                force_overwrite = True
+                logger.warning(f"[CloudUploader] 发现超时半成品，准备覆盖补传: {r2_path}")
+
+            if not force_overwrite:
+                exists_key = None
+                for playlist in ("master.m3u8", "stream.m3u8"):
+                    try:
+                        s3.head_object(Bucket=settings.R2_BUCKET, Key=f"{r2_path}/{playlist}")
+                        exists_key = playlist
+                        break
+                    except Exception:
+                        continue
+                if not exists_key:
+                    raise FileNotFoundError(f"{r2_path}/master.m3u8")
+                # 兼容旧版本上传：没有 ready.json 但播放清单存在，也记录为成功。
+                self._record_task(task_key, {
+                    "filepath": filepath, "tmdb_id": tmdb_id,
+                    "media_type": media_type, "season": season, "episode": episode,
+                }, "success", stage=f"r2_exists:{exists_key}")
+                return "r2_exists"
         except Exception:
             pass  # head_object 抛 404 / NoSuchKey 表示不存在，继续入队
 
@@ -837,14 +857,17 @@ class CloudUploader(_PluginBase):
             return "no_history"
 
         # 3e. 入队补传
-        enqueued = self._enqueue(self._build_upload_params(
+        params = self._build_upload_params(
             filepath=filepath,
             tmdb_id=tmdb_id,
             media_type=media_type,
             season=season,
             episode=episode,
             cleanup_roots=cleanup_roots,
-        ))
+        )
+        if force_overwrite:
+            params["force_overwrite"] = True
+        enqueued = self._enqueue(params)
         if enqueued:
             logger.info(
                 f"[CloudUploader] 扫描补传入队: TMDB-{tmdb_id} "
@@ -852,6 +875,28 @@ class CloudUploader(_PluginBase):
             )
             return "queued"
         return "inflight"  # 已在队列中（_enqueue 返回 False 表示去重跳过）
+
+    def _r2_upload_marker_state(self, s3, r2_path: str) -> str:
+        """Return ready/uploading/stale_uploading/none for upload markers under an R2 path."""
+        try:
+            s3.head_object(Bucket=settings.R2_BUCKET, Key=f"{r2_path}/ready.json")
+            return "ready"
+        except Exception:
+            pass
+
+        try:
+            marker = s3.head_object(Bucket=settings.R2_BUCKET, Key=f"{r2_path}/uploading.json")
+        except Exception:
+            return "none"
+
+        last_modified = marker.get("LastModified")
+        try:
+            marker_ts = last_modified.timestamp() if last_modified else time.time()
+        except Exception:
+            marker_ts = time.time()
+        if time.time() - marker_ts > self._UPLOAD_MARKER_STALE_SECONDS:
+            return "stale_uploading"
+        return "uploading"
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """插件配置表单。"""

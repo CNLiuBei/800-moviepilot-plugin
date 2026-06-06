@@ -101,7 +101,7 @@ def _do_register(
         else:
             print_fn(f"   ⚠️ 未找到 S{season:02d}E{episode:02d} 的分集记录")
 
-    # 4. 删旧播放源 (电影: 删除所有无 episodeId 的源; 剧集: 删除同 episodeId 的源)
+    # 4. 同步播放源（幂等）：同一电影/分集只保留一个目标源，避免重试产生重复源。
     #    复用第 3 步已取到的 detail；电影或未取到时再请求一次。
     if detail is None:
         detail_resp = client.get(f"/api/admin/movies/{movie_id}")
@@ -112,33 +112,20 @@ def _do_register(
 
     _sync_movie_images_to_r2(client, movie_id, detail, print_fn)
 
-    for src in detail.get("sources", []):
-        if episode_id:
-            if src.get("episodeId") == episode_id:
-                client.delete(f"/api/admin/sources/{src['id']}")
-        else:
-            # 电影: 删除所有无 episodeId 的旧源（避免重复）
-            if not src.get("episodeId"):
-                client.delete(f"/api/admin/sources/{src['id']}")
-
-    # 5. 添加播放源
     play_url = f"/api/r2/{r2_path}/master.m3u8" if source_type == "cmaf" else f"/api/r2/{r2_path}/stream.m3u8"
-    resp = client.post("/api/admin/sources", json={
-        "movieId": movie_id,
-        "episodeId": episode_id,
-        "label": f"原画 {quality}" if quality else "原画",
-        "type": source_type,
-        "url": play_url,
-        "quality": quality or "原画",
-        "sortOrder": 0,
-    })
-    if resp.status_code == 200:
-        print_fn(f"   ✅ 播放源已绑定: {play_url}")
-    else:
-        print_fn(f"   播放源绑定失败: {resp.text[:100]}")
+    if not _sync_play_source(
+        client=client,
+        detail=detail,
+        movie_id=movie_id,
+        episode_id=episode_id,
+        play_url=play_url,
+        source_type=source_type,
+        quality=quality,
+        print_fn=print_fn,
+    ):
         return False
 
-    # 6. 更新分集时长（秒）
+    # 5. 更新分集时长（秒）
     if episode_id and duration_secs:
         r = client.patch(f"/api/admin/episodes/{episode_id}", json={"duration": duration_secs})
         if r.status_code == 200:
@@ -146,7 +133,7 @@ def _do_register(
         else:
             print_fn(f"   ⚠️ 时长更新失败: {r.text[:80]}")
 
-    # 7. 字幕清单
+    # 6. 字幕清单
     if subtitles:
         sub_manifest = [
             {
@@ -168,6 +155,88 @@ def _do_register(
 
     print_fn("   ✅ 入库完成!")
     return True
+
+
+def _normalize_source_url(value: str) -> str:
+    value = str(value or "").strip()
+    try:
+        if value.startswith("http://") or value.startswith("https://"):
+            value = urlparse(value).path
+    except Exception:
+        pass
+    return "/" + value.lstrip("/")
+
+
+def _source_scope_matches(src: dict, episode_id: int | None) -> bool:
+    src_episode = src.get("episodeId")
+    if episode_id:
+        return src_episode == episode_id
+    return src_episode in (None, "", 0)
+
+
+def _delete_source(client: httpx.Client, source_id: int, print_fn) -> bool:
+    resp = client.delete(f"/api/admin/sources/{source_id}")
+    if resp.status_code == 200:
+        return True
+    print_fn(f"   ⚠️ 旧播放源删除失败 #{source_id}: {resp.text[:100]}")
+    return False
+
+
+def _sync_play_source(
+    client: httpx.Client,
+    detail: dict,
+    movie_id: int,
+    episode_id: int | None,
+    play_url: str,
+    source_type: str,
+    quality: str,
+    print_fn,
+) -> bool:
+    scoped_sources = [
+        src for src in detail.get("sources", [])
+        if isinstance(src, dict) and _source_scope_matches(src, episode_id)
+    ]
+    target_url = _normalize_source_url(play_url)
+    exact_sources = [
+        src for src in scoped_sources
+        if _normalize_source_url(src.get("url", "")) == target_url
+        and str(src.get("type") or "") == source_type
+    ]
+
+    if exact_sources:
+        keep_id = exact_sources[0].get("id")
+        removed = 0
+        for src in scoped_sources:
+            source_id = src.get("id")
+            if source_id and source_id != keep_id:
+                removed += 1 if _delete_source(client, int(source_id), print_fn) else 0
+        suffix = f"，已清理重复/旧源 {removed} 条" if removed else ""
+        print_fn(f"   ✅ 播放源已存在: {play_url}{suffix}")
+        return True
+
+    removed = 0
+    for src in scoped_sources:
+        source_id = src.get("id")
+        if source_id:
+            removed += 1 if _delete_source(client, int(source_id), print_fn) else 0
+    if removed:
+        print_fn(f"   🧹 已清理旧播放源 {removed} 条")
+
+    resp = client.post("/api/admin/sources", json={
+        "movieId": movie_id,
+        "episodeId": episode_id,
+        "label": f"原画 {quality}" if quality else "原画",
+        "type": source_type,
+        "url": play_url,
+        "quality": quality or "原画",
+        "sortOrder": 0,
+    })
+    if resp.status_code == 200:
+        print_fn(f"   ✅ 播放源已绑定: {play_url}")
+        return True
+
+    print_fn(f"   播放源绑定失败: {resp.text[:100]}")
+    return False
 
 
 def _sync_movie_images_to_r2(client: httpx.Client, movie_id: int, detail: dict, print_fn) -> None:
