@@ -149,7 +149,12 @@ def _do_register(
     # 7. 字幕清单
     if subtitles:
         sub_manifest = [
-            {"lang": sub["lang"], "label": sub["label"], "url": f"/api/r2/{r2_path}/{sub['file']}"}
+            {
+                "lang": sub["lang"],
+                "label": sub["label"],
+                "url": f"/api/r2/{r2_path}/{sub['file']}",
+                **({"hlsUrl": f"/api/r2/{r2_path}/{sub['hls_uri']}"} if sub.get("hls_uri") else {}),
+            }
             for sub in subtitles
         ]
         s3 = get_s3_client()

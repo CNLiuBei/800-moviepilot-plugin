@@ -181,8 +181,13 @@ def validate_hls_media_playlists(output_dir: Path, print_fn=None) -> dict:
 
 # ─── HLS Master Playlist 生成 ───
 
-def generate_hls_master(slice_result: dict, output_dir: Path, print_fn=None) -> str:
-    """生成 HLS Master Playlist (master.m3u8)，支持多音轨。"""
+def _hls_attr(value: object) -> str:
+    """Escape a value for quoted HLS attributes."""
+    return str(value).replace("\\", "\\\\").replace('"', r'\"')
+
+
+def generate_hls_master(slice_result: dict, output_dir: Path, print_fn=None, subtitles_info: list[dict] | None = None) -> str:
+    """生成 HLS Master Playlist (master.m3u8)，支持多音轨和多字幕轨。"""
     if print_fn is None:
         print_fn = print
 
@@ -216,23 +221,37 @@ def generate_hls_master(slice_result: dict, output_dir: Path, print_fn=None) -> 
             m3u8 = track["m3u8"]
             is_default = "YES" if i == 0 else "NO"
             lines.append(
-                f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{title}",'
-                f'LANGUAGE="{lang}",DEFAULT={is_default},AUTOSELECT={is_default},URI="{m3u8}"'
+                f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{_hls_attr(title)}",'
+                f'LANGUAGE="{_hls_attr(lang)}",DEFAULT={is_default},AUTOSELECT={is_default},URI="{_hls_attr(m3u8)}"'
             )
         lines.append("")
     else:
         # 单音轨
         audio_m3u8 = slice_result.get("hlsAudio", "stream-a.m3u8")
-        lines.append(f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="默认音轨",DEFAULT=YES,AUTOSELECT=YES,URI="{audio_m3u8}"')
+        lines.append(f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="默认音轨",DEFAULT=YES,AUTOSELECT=YES,URI="{_hls_attr(audio_m3u8)}"')
         lines.append("")
 
-    lines.append(f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS="{vcodec},{acodec}",RESOLUTION={width}x{height},AUDIO="audio"')
+    # 字幕轨
+    if subtitles_info:
+        for i, sub in enumerate(subtitles_info):
+            is_default = "YES" if i == 0 else "NO"
+            lines.append(
+                f'#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",LANGUAGE="{_hls_attr(sub["lang"])}",'
+                f'NAME="{_hls_attr(sub["name"])}",DEFAULT={is_default},AUTOSELECT=YES,FORCED=NO,URI="{_hls_attr(sub["uri"])}"'
+            )
+        lines.append("")
+
+    stream_inf = f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS="{vcodec},{acodec}",RESOLUTION={width}x{height},AUDIO="audio"'
+    if subtitles_info:
+        stream_inf += ',SUBTITLES="subs"'
+    lines.append(stream_inf)
     lines.append("stream-v.m3u8")
 
     content = "\n".join(lines) + "\n"
     master_path = output_dir / "master.m3u8"
     master_path.write_text(content, encoding="utf-8")
-    print_fn(f"   ✅ master.m3u8 已生成 ({len(audio_tracks)} 音轨)")
+    sub_count = len(subtitles_info) if subtitles_info else 0
+    print_fn(f"   ✅ master.m3u8 已生成 ({len(audio_tracks)} 音轨, {sub_count} 字幕)")
     return content
 
 

@@ -19,7 +19,7 @@ from threading import Thread
 from .runtime_config import settings
 from .parser import parse_filename
 from .slicer import cmaf_demux_slice, get_video_duration
-from .subtitles import extract_subtitles
+from .subtitles import extract_subtitles, generate_hls_subtitle_playlists
 from .register import auto_register, write_episode_nfo, write_show_nfo
 from .notify import notify_upload_success, notify_upload_failed
 from .r2 import get_s3_client, _MIME_MAP
@@ -203,11 +203,11 @@ def _cleanup_empty_parent_dirs(
 
 # ─── CMAF Manifest 生成 ───
 
-def _generate_manifests(output_dir: Path, cmaf_result: dict, log):
+def _generate_manifests(output_dir: Path, cmaf_result: dict, log, subtitles_info: list[dict] | None = None):
     """生成 master.m3u8 和 stream.mpd（多音轨支持）"""
     from .manifest import generate_hls_master, generate_dash_mpd, validate_hls_media_playlists
 
-    generate_hls_master(cmaf_result, output_dir, print_fn=lambda x: None)
+    generate_hls_master(cmaf_result, output_dir, print_fn=lambda x: None, subtitles_info=subtitles_info)
     try:
         playlist_info = validate_hls_media_playlists(output_dir, print_fn=lambda x: None)
         generate_dash_mpd(cmaf_result, playlist_info, output_dir, print_fn=lambda x: None)
@@ -274,6 +274,7 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
 
         # ─── 字幕（切片前提取，避免源文件被移动）───
         subtitles = []
+        subtitles_info = None  # HLS WebVTT 字幕轨信息
         video_duration = None  # 视频时长（秒），切片后填充，用于更新分集时长
         if not params.get("no_subtitles"):
             if cancel_check():
@@ -284,6 +285,7 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
             if subtitles:
                 for sub in subtitles:
                     log(f"   字幕 [{sub['lang']}] {sub['label']}")
+                subtitles_info = generate_hls_subtitle_playlists(subtitles, local_output, print_fn=log)
             else:
                 log("   无内嵌字幕")
 
@@ -335,9 +337,9 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
                     sz = sum(f.stat().st_size for f in local_output.rglob("*") if f.is_file()) / (1024**3)
                     log(f"   ✅ 视频 {v_segs} 片段 + 音频 {a_segs} 片段, {sz:.2f} GB, {time.time()-start:.1f}s")
                     log(f"   编码: {cmaf_result['videoCodec']} + {cmaf_result['audioCodec']}")
-                    if not (local_output / "master.m3u8").exists():
+                    if subtitles_info or not (local_output / "master.m3u8").exists():
                         log("📋 生成 HLS master + DASH MPD...")
-                        _generate_manifests(local_output, cmaf_result, log)
+                        _generate_manifests(local_output, cmaf_result, log, subtitles_info=subtitles_info)
                     log("   ✅ master.m3u8 已就绪")
 
             if not use_cmaf:
