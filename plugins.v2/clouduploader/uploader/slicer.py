@@ -281,3 +281,148 @@ def cmaf_demux_slice(input_path: str, output_dir: Path, print_fn=None) -> dict |
         "height": height,
         "bandwidth": bitrate,
     }
+
+
+
+# ─── 字幕 fMP4 IMSC1 打包（Shaka Packager / stpp） ───
+
+def pack_subtitles_fmp4(
+    vtt_files: list[dict], output_dir: Path, print_fn=None
+) -> list[dict]:
+    """
+    使用 Shaka Packager 将 VTT 字幕转换为 fMP4 IMSC1 (stpp) 格式。
+    Apple AVPlayer 对 CMAF fMP4 仅支持 IMSC1/TTML (stpp)。
+
+    Args:
+        vtt_files: [{"file": "sub-0-zho.vtt", "lang": "zho", "label": "简体中文"}, ...]
+        output_dir: 输出目录（字幕文件放在 subs/ 子目录下）
+
+    Returns:
+        [{"lang": "zh-Hans", "name": "简体中文", "dir": "subs/zhs",
+          "uri": "subs/zhs/stream.m3u8", "init": "subs/zhs/init.mp4"}, ...]
+    """
+    from .runtime_config import settings
+    import subprocess
+
+    if print_fn is None:
+        print_fn = print
+
+    packager_bin = settings.PACKAGER_BIN
+    import shutil as _shutil
+    if not _shutil.which(packager_bin):
+        print_fn("   ⚠️ Shaka Packager 不可用，跳过字幕 fMP4 打包")
+        return []
+
+    LANG_MAP = {
+        'zho': ('zh-Hans', '简体中文'), 'chi': ('zh-Hans', '简体中文'),
+        'zhs': ('zh-Hans', '简体中文'), 'zh': ('zh-Hans', '简体中文'),
+        'zht': ('zh-Hant', '繁体中文'), 'cht': ('zh-Hant', '繁体中文'),
+        'yue': ('yue', '繁體中文(粵語)'), 'can': ('yue', '繁體中文(粵語)'),
+        'eng': ('en', 'English'), 'en': ('en', 'English'),
+        'jpn': ('ja', '日本語'), 'ja': ('ja', '日本語'),
+        'kor': ('ko', '한국어'), 'ko': ('ko', '한국어'),
+    }
+
+    subs_dir = output_dir / "subs"
+    subs_dir.mkdir(parents=True, exist_ok=True)
+    results = []
+    used_names: set = set()
+
+    for i, sub in enumerate(vtt_files):
+        lang_raw = sub.get('lang', 'und')
+        label = sub.get('label', '')
+        vtt_file = sub.get('file', '')
+        vtt_path = output_dir / vtt_file
+
+        if not vtt_path.exists():
+            continue
+
+        mapped_lang, mapped_name = LANG_MAP.get(lang_raw, (lang_raw, label or lang_raw))
+        unique_name = mapped_name
+        if unique_name in used_names:
+            unique_name = f"{mapped_name} ({i+1})"
+        used_names.add(unique_name)
+
+        dir_name = lang_raw
+        existing = [r['dir'].split('/')[-1] for r in results]
+        if dir_name in existing:
+            dir_name = f"{lang_raw}_{len(results)}"
+
+        track_dir = subs_dir / dir_name
+        track_dir.mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            packager_bin,
+            f"in={vtt_path},stream=text,format=ttml+mp4,lang={mapped_lang},"
+            f"init_segment={track_dir}/init.mp4,"
+            f"segment_template={track_dir}/seg-$Number%05d$.m4s",
+            "--segment_duration", "10",
+            "--fragment_duration", "10",
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if result.returncode != 0:
+                print_fn(f"   ⚠️ 字幕打包失败 [{unique_name}]: {result.stderr[-200:]}")
+                continue
+        except Exception as e:
+            print_fn(f"   ⚠️ 字幕打包异常 [{unique_name}]: {e}")
+            continue
+
+        segments = sorted(track_dir.glob("seg-*.m4s"))
+        if not segments:
+            continue
+
+        duration = _get_vtt_duration(vtt_path)
+        if duration <= 0:
+            duration = 3600.0
+
+        stream_m3u8 = track_dir / "stream.m3u8"
+        target_dur = max(1, int(duration) + 1)
+        lines = [
+            "#EXTM3U", "#EXT-X-VERSION:7",
+            f"#EXT-X-TARGETDURATION:{target_dur}",
+            "#EXT-X-PLAYLIST-TYPE:VOD",
+            '#EXT-X-MAP:URI="init.mp4"',
+        ]
+        for seg in segments:
+            lines.append("#EXTINF:10.000,")
+            lines.append(seg.name)
+        lines.append("#EXT-X-ENDLIST")
+        stream_m3u8.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        rel_dir = f"subs/{dir_name}"
+        results.append({
+            "lang": mapped_lang,
+            "name": unique_name,
+            "dir": rel_dir,
+            "uri": f"{rel_dir}/stream.m3u8",
+            "init": f"{rel_dir}/init.mp4",
+        })
+        print_fn(f"   ✅ 字幕 fMP4 [{unique_name}] (stpp): {len(segments)} 段")
+
+    return results
+
+
+def _get_vtt_duration(vtt_path: Path) -> float:
+    try:
+        text = vtt_path.read_text(encoding='utf-8', errors='ignore')
+        last_sec = 0.0
+        for line in text.split('\n'):
+            if '-->' not in line:
+                continue
+            parts = line.strip().split('-->')
+            if len(parts) < 2:
+                continue
+            end_str = parts[1].strip().split()[0].replace(',', '.')
+            ts_parts = end_str.split(':')
+            if len(ts_parts) == 3:
+                secs = float(ts_parts[0]) * 3600 + float(ts_parts[1]) * 60 + float(ts_parts[2])
+            elif len(ts_parts) == 2:
+                secs = float(ts_parts[0]) * 60 + float(ts_parts[1])
+            else:
+                secs = float(ts_parts[0])
+            if secs > last_sec:
+                last_sec = secs
+        return last_sec
+    except Exception:
+        return 0.0

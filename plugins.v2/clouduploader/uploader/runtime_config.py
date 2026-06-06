@@ -59,6 +59,7 @@ class _Settings:
     # 外部二进制路径（可被插件覆盖；默认从 PATH 查找）
     FFMPEG_BIN: str = "ffmpeg"
     FFPROBE_BIN: str = "ffprobe"
+    PACKAGER_BIN: str = "packager"  # Shaka Packager（字幕 fMP4 IMSC1/stpp）
 
     # 通知（沿用独立工具的 Telegram，可选；插件内另有 MoviePilot 通知）
     TG_BOT_TOKEN: str = ""

@@ -85,9 +85,35 @@ def ensure_all(log=print) -> dict:
     一次性确保所有二进制可用。返回检测结果 dict。
     """
     has_ffmpeg, has_ffprobe = ensure_ffmpeg(log=log)
+    has_packager = ensure_packager(log=log)
     return {
         "ffmpeg": has_ffmpeg,
         "ffprobe": has_ffprobe,
+        "packager": has_packager,
         "ffmpeg_path": settings.FFMPEG_BIN,
         "ffprobe_path": settings.FFPROBE_BIN,
+        "packager_path": settings.PACKAGER_BIN if has_packager else None,
     }
+
+
+def ensure_packager(log=print) -> bool:
+    """确保 Shaka Packager 可用（用于字幕 fMP4 IMSC1/stpp 转换）。"""
+    sys_packager = shutil.which(settings.PACKAGER_BIN)
+    if sys_packager:
+        settings.PACKAGER_BIN = sys_packager
+        return True
+    try:
+        import subprocess, sys
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "shaka-packager", "-q"],
+            timeout=120
+        )
+        after = shutil.which("packager") or shutil.which("shaka-packager")
+        if after:
+            settings.PACKAGER_BIN = after
+            log("   packager: pip 安装成功")
+            return True
+    except Exception:
+        pass
+    log("   packager: 不可用（字幕将不支持 fMP4 IMSC1）")
+    return False
