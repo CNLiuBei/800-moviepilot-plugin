@@ -1,0 +1,62 @@
+name: Auto Release CloudUploader
+
+# 当推送到 main 且 package.v2.json 变化时，自动按版本号打包并发布 Release
+on:
+  push:
+    branches: [main]
+    paths:
+      - "package.v2.json"
+      - "plugins.v2/clouduploader/**"
+  workflow_dispatch: {}  # 也支持手动触发
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version from package.v2.json
+        id: ver
+        run: |
+          VERSION=$(python3 -c "import json;print(json.load(open('package.v2.json'))['CloudUploader']['version'])")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=CloudUploader_v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "asset=clouduploader_v${VERSION}.zip" >> "$GITHUB_OUTPUT"
+          echo "插件版本: $VERSION"
+
+      - name: Check if release already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.ver.outputs.tag }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release ${{ steps.ver.outputs.tag }} 已存在，跳过。"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package plugin (zip root = plugin files)
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          cd plugins.v2/clouduploader
+          zip -r -X "${{ github.workspace }}/${{ steps.ver.outputs.asset }}" . \
+            -x "*.pyc" -x "*__pycache__*" -x "*.DS_Store"
+          cd "${{ github.workspace }}"
+          echo "打包内容:"
+          unzip -l "${{ steps.ver.outputs.asset }}"
+
+      - name: Create Release
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.ver.outputs.tag }}" \
+            "${{ steps.ver.outputs.asset }}" \
+            --repo "${{ github.repository }}" \
+            --title "CloudUploader v${{ steps.ver.outputs.version }}" \
+            --notes "自动发布 v${{ steps.ver.outputs.version }}。MoviePilot 添加本仓库后可直接安装/升级。"

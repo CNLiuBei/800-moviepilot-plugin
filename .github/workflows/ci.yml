@@ -1,0 +1,26 @@
+name: Validate Plugins
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate package metadata
+        run: python -m json.tool package.v2.json >/dev/null
+
+      - name: Compile CloudUploader plugin
+        run: python -m py_compile $(find plugins.v2/clouduploader -name "*.py")
