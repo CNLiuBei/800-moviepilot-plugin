@@ -10,6 +10,7 @@ from .runtime_config import ConfigError, normalize_base_url, settings
 from .r2 import get_s3_client
 
 _HTTPX_REQUEST_KWARGS = {"trust_env": False}
+_TMDB_NFO_TIMEOUT = 5
 
 
 def _api_error(resp: httpx.Response, prefix: str) -> str:
@@ -274,6 +275,29 @@ def write_episode_nfo(
     if print_fn is None:
         print_fn = print
 
+    def esc(s):
+        return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    def put_minimal_episode_nfo(reason: str):
+        try:
+            lines = [
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+                "<episodedetails>",
+                f"  <title>S{season:02d}E{episode:02d}</title>",
+                f"  <season>{season}</season>",
+                f"  <episode>{episode}</episode>",
+                f"  <uniqueid type=\"tmdb\">{tmdb_id}</uniqueid>",
+                f"  <fileinfo><streamdetails><video><codec>copy</codec><aspect>{esc(resolution or 'original')}</aspect></video></streamdetails></fileinfo>",
+                "</episodedetails>",
+            ]
+            get_s3_client().put_object(
+                Bucket=settings.R2_BUCKET, Key=f"{r2_path}/episode.nfo",
+                Body="\n".join(lines).encode("utf-8"), ContentType="application/xml",
+            )
+            print_fn(f"   ⚠️ episode.nfo 使用最小元数据: {reason}")
+        except Exception as e:
+            print_fn(f"   ⚠️ episode.nfo 最小元数据写入失败: {e}")
+
     try:
         _auth = settings.tmdb_auth
         try:
@@ -281,14 +305,12 @@ def write_episode_nfo(
                 f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/{season}/episode/{episode}",
                 params={"language": "zh-CN", **_auth["params"]},
                 headers=_auth["headers"],
-                timeout=15,
+                timeout=_TMDB_NFO_TIMEOUT,
                 **_HTTPX_REQUEST_KWARGS,
             ).json()
         except httpx.HTTPError as e:
-            raise RuntimeError(_request_error("TMDB episode 请求失败", e)) from e
-
-        def esc(s):
-            return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            put_minimal_episode_nfo(_request_error("TMDB episode 请求失败", e))
+            return
 
         lines = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>', "<episodedetails>"]
         lines.append(f"  <title>{esc(ep.get('name', ''))}</title>")
@@ -319,7 +341,7 @@ def write_episode_nfo(
         if ep.get('still_path'):
             img = httpx.get(
                 f"https://image.tmdb.org/t/p/w500{ep['still_path']}",
-                timeout=15, follow_redirects=True,
+                timeout=_TMDB_NFO_TIMEOUT, follow_redirects=True,
                 **_HTTPX_REQUEST_KWARGS,
             )
             if img.status_code == 200:
@@ -340,6 +362,28 @@ def write_show_nfo(tmdb_id: int, media_type: str, print_fn=None):
     if print_fn is None:
         print_fn = print
 
+    def esc(s):
+        return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    def put_minimal_show_nfo(reason: str):
+        try:
+            root = "tvshow" if media_type == "tv" else "movie"
+            nfo_name = "tvshow.nfo" if media_type == "tv" else "movie.nfo"
+            lines = [
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+                f"<{root}>",
+                f"  <title>TMDB {tmdb_id}</title>",
+                f"  <uniqueid type=\"tmdb\">{tmdb_id}</uniqueid>",
+                f"</{root}>",
+            ]
+            get_s3_client().put_object(
+                Bucket=settings.R2_BUCKET, Key=f"tmdb/{media_type}/{tmdb_id}/{nfo_name}",
+                Body="\n".join(lines).encode("utf-8"), ContentType="application/xml",
+            )
+            print_fn(f"   ⚠️ {nfo_name} 使用最小元数据: {reason}")
+        except Exception as e:
+            print_fn(f"   ⚠️ show nfo 最小元数据写入失败: {e}")
+
     try:
         _auth = settings.tmdb_auth
         try:
@@ -347,14 +391,12 @@ def write_show_nfo(tmdb_id: int, media_type: str, print_fn=None):
                 f"https://api.themoviedb.org/3/{media_type}/{tmdb_id}",
                 params={"language": "zh-CN", "append_to_response": "credits,external_ids", **_auth["params"]},
                 headers=_auth["headers"],
-                timeout=15,
+                timeout=_TMDB_NFO_TIMEOUT,
                 **_HTTPX_REQUEST_KWARGS,
             ).json()
         except httpx.HTTPError as e:
-            raise RuntimeError(_request_error("TMDB show 请求失败", e)) from e
-
-        def esc(s):
-            return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            put_minimal_show_nfo(_request_error("TMDB show 请求失败", e))
+            return
 
         root = "tvshow" if media_type == "tv" else "movie"
         title = d.get("name") or d.get("title") or ""

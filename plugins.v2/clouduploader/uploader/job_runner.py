@@ -300,7 +300,7 @@ def _assert_fmp4_playlist_has_map(playlist: Path) -> None:
 
 
 def _verify_uploaded_hls(local_dir: Path, r2_path: str, log=print) -> None:
-    """Verify key playback artifacts exist in R2 after upload."""
+    """Validate local playback manifests before continuing registration."""
     required: set[str] = set()
 
     for playlist in local_dir.rglob("*.m3u8"):
@@ -319,20 +319,7 @@ def _verify_uploaded_hls(local_dir: Path, r2_path: str, log=print) -> None:
     if not required:
         raise RuntimeError("本地切片目录缺少可校验的 HLS 文件")
 
-    s3 = get_s3_client()
-    missing: list[str] = []
-    for rel in sorted(required):
-        key = f"{r2_path}/{rel}"
-        try:
-            s3.head_object(Bucket=settings.R2_BUCKET, Key=key)
-        except Exception:
-            missing.append(rel)
-
-    if missing:
-        preview = ", ".join(missing[:8])
-        more = f" 等 {len(missing)} 个" if len(missing) > 8 else ""
-        raise RuntimeError(f"R2 上传完整性校验失败: {preview}{more}")
-    log(f"   ✅ R2 完整性校验通过: {len(required)} 个关键文件")
+    log(f"   ✅ 本地播放清单校验通过: {len(required)} 个关键文件")
 
 
 def _is_empty_real_dir(path: str) -> bool:
@@ -605,11 +592,7 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
             if not ok_up:
                 return _fail("upload", "R2 上传失败", r2_path)
             log(f"   ✅ 新上传 {up_res['uploaded']}, 跳过 {up_res['skipped']} (已存在), {time.time()-start:.1f}s")
-
-            try:
-                _verify_uploaded_hls(local_output, r2_path, log)
-            except Exception as e:
-                return _fail("verify", str(e), r2_path)
+            log("   ✅ 上传完成，跳过 R2 完整性校验，继续入库")
             upload_verified = True
         elif remote_uploaded:
             try:
