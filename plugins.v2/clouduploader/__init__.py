@@ -23,6 +23,7 @@ from app.plugins import _PluginBase
 from app.schemas.types import EventType, NotificationType
 
 from .uploader.runtime_config import settings
+from .uploader.runtime_config import ConfigError, normalize_base_url
 from .uploader.job_runner import run_job
 from .uploader import notify as _notify_mod
 from .uploader import installer as _installer
@@ -42,7 +43,7 @@ class CloudUploader(_PluginBase):
     plugin_name = "云端自动上传"
     plugin_desc = "整理完成后自动切片(CMAF)→上传R2→入库到流媒体站，全流程在插件内完成。"
     plugin_icon = "upload.png"
-    plugin_version = "2.4.5"
+    plugin_version = "2.4.6"
     plugin_author = "cn"
     author_url = "https://github.com/CNLiuBei/800-moviepilot-plugin"
     plugin_config_prefix = "clouduploader_"
@@ -136,12 +137,17 @@ class CloudUploader(_PluginBase):
 
         # 注入业务配置到 runtime settings
         hls_dir = self.get_data_path() / "hls-output"
+        try:
+            api_base = normalize_base_url(config.get("api_base", ""), "流媒体站地址")
+        except ConfigError as e:
+            logger.error(f"[CloudUploader] {e}")
+            api_base = ""
         settings.configure(
             r2_account_id=r2_account_id,
             r2_access_key_id=r2_access_key_id,
             r2_secret_access_key=r2_secret_access_key,
             r2_bucket=r2_bucket,
-            api_base=config.get("api_base", ""),
+            api_base=api_base,
             api_admin_key=config.get("api_admin_key", ""),
             api_username=config.get("api_username", ""),
             api_password=config.get("api_password", ""),
@@ -369,7 +375,18 @@ class CloudUploader(_PluginBase):
                         self._task_progress[key]["stage"] = "已取消"
                 else:
                     self._stats["error"] += 1
-                    self._record_task(key, params, "error",
+                    retry_params = params
+                    if result.get("stage") == "register" and result.get("r2_path"):
+                        retry_params = {
+                            **params,
+                            "remote_uploaded": True,
+                            "remote_uploaded_marker": True,
+                            "skip_slice": True,
+                            "skip_upload": True,
+                            "no_subtitles": True,
+                            "clean_after": False,
+                        }
+                    self._record_task(key, retry_params, "error",
                                       error=result.get("error", ""), stage=result.get("stage", ""))
                     if key in self._task_progress:
                         self._task_progress[key]["status"] = "error"
@@ -779,7 +796,7 @@ class CloudUploader(_PluginBase):
         Returns:
             "success"    - 任务记录中已成功，跳过
             "no_history" - MP 整理历史中找不到该文件，跳过
-            "r2_exists"  - R2 上已有对应播放清单，跳过
+            "r2_exists"  - R2 上已有 ready.json，跳过
             "inflight"   - 已在队列/执行中，跳过
             "uploading"   - R2 上存在较新的 uploading.json，暂不补传
             "queued"     - 已入队补传
@@ -834,11 +851,20 @@ class CloudUploader(_PluginBase):
                     "media_type": media_type, "season": season, "episode": episode,
                 }, "success", stage="r2_ready")
                 return "r2_exists"
+            if marker_state == "uploaded":
+                return self._enqueue_remote_register(
+                    filepath=filepath,
+                    tmdb_id=tmdb_id,
+                    media_type=media_type,
+                    season=season,
+                    episode=episode,
+                    has_uploaded_marker=True,
+                    cleanup_roots=cleanup_roots,
+                )
             if marker_state == "uploading":
                 return "uploading"
             if marker_state == "stale_uploading":
-                force_overwrite = True
-                logger.warning(f"[CloudUploader] 发现超时半成品，准备覆盖补传: {r2_path}")
+                logger.warning(f"[CloudUploader] 发现超时半成品，按缺失文件补传: {r2_path}")
 
             if not force_overwrite:
                 exists_key = None
@@ -851,12 +877,16 @@ class CloudUploader(_PluginBase):
                         continue
                 if not exists_key:
                     raise FileNotFoundError(f"{r2_path}/master.m3u8")
-                # 兼容旧版本上传：没有 ready.json 但播放清单存在，也记录为成功。
-                self._record_task(task_key, {
-                    "filepath": filepath, "tmdb_id": tmdb_id,
-                    "media_type": media_type, "season": season, "episode": episode,
-                }, "success", stage=f"r2_exists:{exists_key}")
-                return "r2_exists"
+                logger.info(f"[CloudUploader] 发现旧版已上传播放清单，补执行入库: {r2_path}/{exists_key}")
+                return self._enqueue_remote_register(
+                    filepath=filepath,
+                    tmdb_id=tmdb_id,
+                    media_type=media_type,
+                    season=season,
+                    episode=episode,
+                    has_uploaded_marker=False,
+                    cleanup_roots=cleanup_roots,
+                )
         except Exception:
             pass  # head_object 抛 404 / NoSuchKey 表示不存在，继续入队
 
@@ -884,11 +914,47 @@ class CloudUploader(_PluginBase):
             return "queued"
         return "inflight"  # 已在队列中（_enqueue 返回 False 表示去重跳过）
 
+    def _enqueue_remote_register(self, filepath: str, tmdb_id, media_type: str,
+                                 season=None, episode=None,
+                                 has_uploaded_marker: bool = False,
+                                 cleanup_roots: Optional[List[str]] = None) -> str:
+        """R2 已有完整对象时，只补站点入库，不重复切片/上传。"""
+        params = self._build_upload_params(
+            filepath=filepath,
+            tmdb_id=tmdb_id,
+            media_type=media_type,
+            season=season,
+            episode=episode,
+            cleanup_roots=cleanup_roots,
+        )
+        params.update({
+            "remote_uploaded": True,
+            "remote_uploaded_marker": has_uploaded_marker,
+            "skip_slice": True,
+            "skip_upload": True,
+            "no_subtitles": True,
+            "clean_after": False,
+        })
+        enqueued = self._enqueue(params)
+        if enqueued:
+            logger.info(
+                f"[CloudUploader] 补入库入队: TMDB-{tmdb_id} "
+                f"{_episode_label(season, episode)} | {Path(filepath).name}"
+            )
+            return "queued"
+        return "inflight"
+
     def _r2_upload_marker_state(self, s3, r2_path: str) -> str:
-        """Return ready/uploading/stale_uploading/none for upload markers under an R2 path."""
+        """Return ready/uploaded/uploading/stale_uploading/none for upload markers under an R2 path."""
         try:
             s3.head_object(Bucket=settings.R2_BUCKET, Key=f"{r2_path}/ready.json")
             return "ready"
+        except Exception:
+            pass
+
+        try:
+            s3.head_object(Bucket=settings.R2_BUCKET, Key=f"{r2_path}/uploaded.json")
+            return "uploaded"
         except Exception:
             pass
 

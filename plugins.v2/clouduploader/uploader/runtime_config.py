@@ -10,6 +10,29 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit, urlunsplit
+
+
+class ConfigError(ValueError):
+    """配置项非法。"""
+
+
+def normalize_base_url(value: object, label: str = "URL") -> str:
+    """规范化站点根地址，避免 httpx 抛出难懂的 Invalid port。"""
+    raw = str(value or "").strip().replace("：", ":")
+    raw = "".join(ch for ch in raw if ord(ch) >= 32)
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = f"https://{raw}"
+    try:
+        parsed = urlsplit(raw)
+        _ = parsed.port
+    except ValueError as e:
+        raise ConfigError(f"{label} 配置错误: {raw!r} ({e})") from e
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ConfigError(f"{label} 必须是 http(s) 站点根地址: {raw!r}")
+    return urlunsplit((parsed.scheme, parsed.netloc, "", "", "")).rstrip("/")
 
 
 class _Settings:
@@ -85,6 +108,8 @@ class _Settings:
                         value = int(value)
                     except (TypeError, ValueError):
                         continue
+                elif key_upper == "API_BASE":
+                    value = normalize_base_url(value, "流媒体站地址")
                 setattr(self, key_upper, value)
 
     def validate(self) -> list[str]:

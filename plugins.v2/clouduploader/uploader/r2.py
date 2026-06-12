@@ -2,8 +2,11 @@
 R2 上传模块（插件内嵌版）
 """
 import boto3
+from botocore.config import Config
 
 from .runtime_config import settings
+
+_BOTO_CONFIG = Config(proxies={})
 
 _MIME_MAP = {
     ".m3u8": "application/vnd.apple.mpegurl",
@@ -30,4 +33,5 @@ def get_s3_client():
         aws_access_key_id=settings.R2_ACCESS_KEY_ID,
         aws_secret_access_key=settings.R2_SECRET_ACCESS_KEY,
         region_name="auto",
+        config=_BOTO_CONFIG,
     )

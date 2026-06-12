@@ -2,11 +2,43 @@
 自动入库 + NFO 生成模块（插件内嵌版）
 """
 import json
+import time
 
 import httpx
 
-from .runtime_config import settings
+from .runtime_config import ConfigError, normalize_base_url, settings
 from .r2 import get_s3_client
+
+_HTTPX_REQUEST_KWARGS = {"trust_env": False}
+
+
+def _api_error(resp: httpx.Response, prefix: str) -> str:
+    """从 API 响应中提取可读错误信息。"""
+    try:
+        data = resp.json()
+        if isinstance(data, dict):
+            msg = data.get("message") or data.get("error") or data.get("status_message")
+            if msg:
+                return f"{prefix} [{resp.status_code}] — {msg}"
+    except (ValueError, json.JSONDecodeError):
+        pass
+    text = (resp.text or "").strip()
+    if text:
+        return f"{prefix} [{resp.status_code}] — {text[:500]}"
+    return f"{prefix} [{resp.status_code}]"
+
+
+def _normalize_media_type(media_type: str) -> str:
+    value = (media_type or "tv").strip().lower()
+    return "movie" if value == "movie" else "tv"
+
+
+def _has_episode_numbers(season, episode) -> bool:
+    return season is not None and episode is not None
+
+
+def _request_error(prefix: str, error: Exception) -> str:
+    return f"{prefix}: {error}"
 
 
 def auto_register(
@@ -16,7 +48,7 @@ def auto_register(
     source_type: str = "cmaf", print_fn=None,
 ) -> tuple[bool, str]:
     """
-    自动入库: 导入 TMDB 元数据 → 按 TMDB movie/tv/season/episode 结构绑定播放源 + 字幕
+    自动入库: 导入 TMDB 元数据 → 按 TMDB 身份绑定播放源 + 字幕
 
     Returns:
         (True, "")              成功
@@ -25,18 +57,42 @@ def auto_register(
     if print_fn is None:
         print_fn = print
 
+    try:
+        api_base = normalize_base_url(settings.API_BASE, "流媒体站地址")
+    except ConfigError as e:
+        msg = str(e)
+        print_fn(f"   ❌ {msg}")
+        return False, msg
+    if not api_base:
+        msg = "未配置流媒体站地址 (api_base)"
+        print_fn(f"   ❌ {msg}")
+        return False, msg
+
     print_fn("🔗 自动入库...")
+    media_type = _normalize_media_type(media_type)
 
-    client = httpx.Client(base_url=settings.API_BASE, timeout=60, follow_redirects=True)
+    try:
+        client = httpx.Client(base_url=api_base, timeout=120, follow_redirects=True, **_HTTPX_REQUEST_KWARGS)
+    except httpx.InvalidURL as e:
+        msg = _request_error("流媒体站地址配置错误", e)
+        print_fn(f"   ❌ {msg}")
+        return False, msg
 
-    # 认证：优先 admin key，否则用用户名登录
     if settings.API_ADMIN_KEY:
         client.headers["x-admin-key"] = settings.API_ADMIN_KEY
         print_fn("   ✅ API Key 认证")
     elif settings.API_USERNAME and settings.API_PASSWORD:
-        resp = client.post("/api/auth/sign-in/username", json={"username": settings.API_USERNAME, "password": settings.API_PASSWORD})
+        try:
+            resp = client.post(
+                "/api/auth/sign-in/username",
+                json={"username": settings.API_USERNAME, "password": settings.API_PASSWORD},
+            )
+        except httpx.HTTPError as e:
+            msg = _request_error("认证失败: 请求站点失败", e)
+            print_fn(f"   ❌ {msg}")
+            return False, msg
         if resp.status_code != 200:
-            msg = f"认证失败: 登录失败 [{resp.status_code}] — {resp.text[:500]}"
+            msg = _api_error(resp, "认证失败: 登录失败")
             print_fn(f"   ❌ {msg}")
             return False, msg
         print_fn("   ✅ 登录成功")
@@ -44,29 +100,35 @@ def auto_register(
         msg = "认证失败: 未配置 API_ADMIN_KEY 或 API_USERNAME/API_PASSWORD"
         print_fn(f"   ❌ {msg}")
         return False, msg
+
     try:
-        return _do_register(client, tmdb_id, media_type, season, episode,
-                            r2_path, quality, subtitles, duration_secs, source_type, print_fn)
+        return _do_register(
+            client, tmdb_id, media_type, season, episode,
+            r2_path, quality, subtitles, duration_secs, source_type, print_fn,
+        )
     finally:
         client.close()
 
 
-def _do_register(
-    client: httpx.Client, tmdb_id: int, media_type: str, season: int | None,
-    episode: int | None, r2_path: str, quality: str,
-    subtitles: list[dict], duration_secs: int | None,
-    source_type: str, print_fn,
+def _import_tmdb(
+    client: httpx.Client,
+    tmdb_id: int,
+    media_type: str,
+    fetch_episodes: bool,
+    print_fn,
 ) -> tuple[bool, str]:
-    """内部实现，确保 client 在 finally 中关闭。返回 (ok, error_msg)。"""
-
-    # 使用 x-admin-key 或已登录 session 认证
-
-    # 2. 导入/刷新 TMDB 元数据
-    resp = client.post("/api/admin/import-single", json={
-        "tmdbId": tmdb_id, "type": media_type, "fetchEpisodes": True,
-    })
+    try:
+        resp = client.post("/api/admin/import-single", json={
+            "tmdbId": tmdb_id,
+            "type": media_type,
+            "fetchEpisodes": bool(fetch_episodes and media_type == "tv"),
+        })
+    except httpx.HTTPError as e:
+        msg = _request_error("TMDB导入失败: 请求站点失败", e)
+        print_fn(f"   ❌ {msg}")
+        return False, msg
     if resp.status_code != 200:
-        msg = f"TMDB导入失败 [{resp.status_code}] — {resp.text[:500]}"
+        msg = _api_error(resp, "TMDB导入失败")
         print_fn(f"   ❌ {msg}")
         return False, msg
     try:
@@ -75,9 +137,30 @@ def _do_register(
         msg = f"TMDB导入响应异常 — {resp.text[:500]}"
         print_fn(f"   ❌ {msg}")
         return False, msg
-    print_fn(f"   ✅ TMDB 元数据已导入: {media_type}/{tmdb_id} (episodes: {import_data.get('episodes')})")
+    print_fn(
+        f"   ✅ TMDB 元数据已导入: {media_type}/{tmdb_id} "
+        f"(episodes: {import_data.get('episodes')}, movieId: {import_data.get('movieId')})"
+    )
+    return True, ""
 
-    play_url = f"/api/r2/{r2_path}/master.m3u8" if source_type == "cmaf" else f"/api/r2/{r2_path}/stream.m3u8"
+
+def _do_register(
+    client: httpx.Client, tmdb_id: int, media_type: str, season: int | None,
+    episode: int | None, r2_path: str, quality: str,
+    subtitles: list[dict], duration_secs: int | None,
+    source_type: str, print_fn,
+) -> tuple[bool, str]:
+    play_url = (
+        f"/api/r2/{r2_path}/master.m3u8"
+        if source_type == "cmaf"
+        else f"/api/r2/{r2_path}/stream.m3u8"
+    )
+
+    # 首次轻量导入（不拉全季分集，避免每集重复打 TMDB）；失败再拉全量分集重试。
+    ok, err = _import_tmdb(client, tmdb_id, media_type, fetch_episodes=False, print_fn=print_fn)
+    if not ok:
+        return False, err
+
     ok_src, err_src = _sync_play_source(
         client=client,
         tmdb_id=tmdb_id,
@@ -90,10 +173,31 @@ def _do_register(
         duration_secs=duration_secs,
         print_fn=print_fn,
     )
-    if not ok_src:
+    if ok_src:
+        pass
+    elif media_type == "tv" and _has_episode_numbers(season, episode):
+        print_fn("   ⏳ 播放源绑定失败，拉取 TMDB 分集后重试...")
+        ok, err = _import_tmdb(client, tmdb_id, media_type, fetch_episodes=True, print_fn=print_fn)
+        if not ok:
+            return False, err
+        time.sleep(2)
+        ok_src, err_src = _sync_play_source(
+            client=client,
+            tmdb_id=tmdb_id,
+            media_type=media_type,
+            season=season,
+            episode=episode,
+            play_url=play_url,
+            source_type=source_type,
+            quality=quality,
+            duration_secs=duration_secs,
+            print_fn=print_fn,
+        )
+        if not ok_src:
+            return False, err_src
+    else:
         return False, err_src
 
-    # 5. 字幕清单
     if subtitles:
         sub_manifest = [
             {
@@ -129,7 +233,7 @@ def _sync_play_source(
     duration_secs: int | None,
     print_fn,
 ) -> tuple[bool, str]:
-    """绑定播放源。返回 (ok, error_msg)。"""
+    """按 TMDB 身份绑定播放源。返回 (ok, error_msg)。"""
     payload = {
         "tmdbId": tmdb_id,
         "mediaType": media_type,
@@ -140,20 +244,23 @@ def _sync_play_source(
         "sortOrder": 0,
         "replace": True,
     }
-    if season is not None and episode is not None:
-        payload["seasonNumber"] = season
-        payload["episodeNumber"] = episode
+    if _has_episode_numbers(season, episode):
+        payload["seasonNumber"] = int(season)
+        payload["episodeNumber"] = int(episode)
     if duration_secs:
-        payload["durationSecs"] = duration_secs
+        payload["durationSecs"] = int(duration_secs)
 
-    resp = client.post("/api/admin/sources", json={
-        **payload,
-    })
+    try:
+        resp = client.post("/api/admin/sources", json=payload)
+    except httpx.HTTPError as e:
+        msg = _request_error("播放源绑定失败: 请求站点失败", e)
+        print_fn(f"   ❌ {msg}")
+        return False, msg
     if resp.status_code == 200:
         print_fn(f"   ✅ 播放源已绑定: {play_url}")
         return True, ""
 
-    msg = f"播放源绑定失败 [{resp.status_code}] — {resp.text[:500]}"
+    msg = _api_error(resp, "播放源绑定失败")
     print_fn(f"   ❌ {msg}")
     return False, msg
 
@@ -169,12 +276,16 @@ def write_episode_nfo(
 
     try:
         _auth = settings.tmdb_auth
-        ep = httpx.get(
-            f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/{season}/episode/{episode}",
-            params={"language": "zh-CN", **_auth["params"]},
-            headers=_auth["headers"],
-            timeout=15,
-        ).json()
+        try:
+            ep = httpx.get(
+                f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/{season}/episode/{episode}",
+                params={"language": "zh-CN", **_auth["params"]},
+                headers=_auth["headers"],
+                timeout=15,
+                **_HTTPX_REQUEST_KWARGS,
+            ).json()
+        except httpx.HTTPError as e:
+            raise RuntimeError(_request_error("TMDB episode 请求失败", e)) from e
 
         def esc(s):
             return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -205,11 +316,11 @@ def write_episode_nfo(
         )
         print_fn(f"   ✅ episode.nfo: {ep.get('name', '')}")
 
-        # 缩略图
         if ep.get('still_path'):
             img = httpx.get(
                 f"https://image.tmdb.org/t/p/w500{ep['still_path']}",
                 timeout=15, follow_redirects=True,
+                **_HTTPX_REQUEST_KWARGS,
             )
             if img.status_code == 200:
                 s3.put_object(
@@ -231,12 +342,16 @@ def write_show_nfo(tmdb_id: int, media_type: str, print_fn=None):
 
     try:
         _auth = settings.tmdb_auth
-        d = httpx.get(
-            f"https://api.themoviedb.org/3/{media_type}/{tmdb_id}",
-            params={"language": "zh-CN", "append_to_response": "credits,external_ids", **_auth["params"]},
-            headers=_auth["headers"],
-            timeout=15,
-        ).json()
+        try:
+            d = httpx.get(
+                f"https://api.themoviedb.org/3/{media_type}/{tmdb_id}",
+                params={"language": "zh-CN", "append_to_response": "credits,external_ids", **_auth["params"]},
+                headers=_auth["headers"],
+                timeout=15,
+                **_HTTPX_REQUEST_KWARGS,
+            ).json()
+        except httpx.HTTPError as e:
+            raise RuntimeError(_request_error("TMDB show 请求失败", e)) from e
 
         def esc(s):
             return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")

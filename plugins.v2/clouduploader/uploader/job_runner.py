@@ -97,6 +97,14 @@ def upload_directory_smart(local_dir: Path, r2_prefix: str, on_progress, cancel_
                 pass
         existing.clear()
 
+    pending_files = [
+        f for f in files
+        if force_overwrite or existing.get(str(f.relative_to(local_dir)).replace("\\", "/")) != f.stat().st_size
+    ]
+    if not pending_files:
+        on_progress(1, 0, 0)
+        return 0, len(files)
+
     uploaded = 0
     skipped = 0
     failed = 0
@@ -107,7 +115,7 @@ def upload_directory_smart(local_dir: Path, r2_prefix: str, on_progress, cancel_
     start_time = time.time()
 
     def upload_one(f: Path) -> tuple[str, int]:
-        rel_key = str(f.relative_to(local_dir))
+        rel_key = str(f.relative_to(local_dir)).replace("\\", "/")
         local_size = f.stat().st_size
         if not force_overwrite and existing.get(rel_key) == local_size:
             return "skip", local_size
@@ -166,6 +174,22 @@ def upload_directory_smart(local_dir: Path, r2_prefix: str, on_progress, cancel_
     return uploaded, skipped
 
 
+def _upload_marker_payload(
+    filepath: str,
+    source_type: str,
+    quality: str,
+    subtitles: list[dict],
+    duration_secs: int | None,
+) -> dict:
+    return {
+        "file": Path(filepath).name,
+        "sourceType": source_type,
+        "quality": quality or "原画",
+        "durationSecs": duration_secs,
+        "subtitles": subtitles,
+    }
+
+
 def _put_upload_marker(r2_path: str, status: str, payload: dict | None = None, log=print) -> None:
     """Write a small R2 marker so later reconciliation can distinguish partial uploads."""
     try:
@@ -189,6 +213,28 @@ def _delete_upload_marker(r2_path: str, status: str, log=print) -> None:
         get_s3_client().delete_object(Bucket=settings.R2_BUCKET, Key=f"{r2_path}/{status}.json")
     except Exception as e:
         log(f"   ⚠️ 上传标记清理失败 ({status}): {e}")
+
+
+def _read_upload_marker(r2_path: str, status: str, log=print) -> dict:
+    try:
+        obj = get_s3_client().get_object(Bucket=settings.R2_BUCKET, Key=f"{r2_path}/{status}.json")
+        body = obj["Body"].read()
+        data = json.loads(body.decode("utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        log(f"   ⚠️ 上传标记读取失败 ({status}): {e}")
+        return {}
+
+
+def _remote_source_type(r2_path: str) -> str:
+    s3 = get_s3_client()
+    for source_type, playlist in (("cmaf", "master.m3u8"), ("hls", "stream.m3u8")):
+        try:
+            s3.head_object(Bucket=settings.R2_BUCKET, Key=f"{r2_path}/{playlist}")
+            return source_type
+        except Exception:
+            continue
+    raise RuntimeError("R2 缺少 master.m3u8/stream.m3u8，无法确认播放清单")
 
 
 def _playlist_uri_value(value: str) -> str | None:
@@ -423,12 +469,25 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
         local_output = settings.HLS_OUTPUT_DIR / r2_path
         log(f"📂 R2 路径: {r2_path}/")
 
+        remote_uploaded = bool(params.get("remote_uploaded"))
+        has_remote_marker = bool(params.get("remote_uploaded_marker"))
+        remote_marker = _read_upload_marker(r2_path, "uploaded", log) if has_remote_marker else {}
+
         # ─── 字幕（切片前提取，避免源文件被移动）───
         subtitles = []
         subtitles_info = None  # HLS WebVTT 字幕轨信息
         video_duration = None  # 视频时长（秒），切片后填充，用于更新分集时长
         upload_verified = False
-        if not params.get("no_subtitles"):
+        if remote_uploaded:
+            marker_subtitles = remote_marker.get("subtitles")
+            if isinstance(marker_subtitles, list):
+                subtitles = [sub for sub in marker_subtitles if isinstance(sub, dict)]
+            if remote_marker.get("durationSecs"):
+                video_duration = int(remote_marker["durationSecs"])
+            if not resolution and remote_marker.get("quality"):
+                resolution = str(remote_marker["quality"])
+            log("📦 R2 已有完整上传标记，本次跳过切片/上传，直接补入库")
+        elif not params.get("no_subtitles"):
             if cancel_check():
                 return {"status": "cancelled", "error": None, "r2_path": r2_path}
             log("📝 提取字幕...")
@@ -442,7 +501,7 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
                 log("   无内嵌字幕")
 
         # ─── 切片 ───
-        if not params.get("skip_slice"):
+        if not params.get("skip_slice") and not remote_uploaded:
             if cancel_check():
                 return {"status": "cancelled", "error": None, "r2_path": r2_path}
 
@@ -508,7 +567,7 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
                 log(f"   ✅ {len(segs)} 片段, {sz:.2f} GB, {time.time()-start:.1f}s")
 
         # ─── 上传 ───
-        if not params.get("skip_upload"):
+        if not params.get("skip_upload") and not remote_uploaded:
             if cancel_check():
                 return {"status": "cancelled", "error": None, "r2_path": r2_path}
             force_overwrite = params.get("force_overwrite", False)
@@ -546,6 +605,12 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
             except Exception as e:
                 return _fail("verify", str(e), r2_path)
             upload_verified = True
+        elif remote_uploaded:
+            try:
+                _remote_source_type(r2_path)
+            except Exception as e:
+                return {"status": "error", "error": str(e), "r2_path": r2_path, "stage": "verify"}
+            upload_verified = True
         elif local_output and local_output.exists():
             try:
                 _verify_uploaded_hls(local_output, r2_path, log)
@@ -561,9 +626,12 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
 
         # ─── 入库（关键步骤，失败需重试，否则前端看不到该集）───
         if not params.get("skip_register"):
-            source_type = "hls"
-            if params.get("cmaf", True):
-                if (local_output / "master.m3u8").exists():
+            marker_source_type = str(remote_marker.get("sourceType") or "")
+            source_type = marker_source_type if marker_source_type in {"cmaf", "hls"} else "hls"
+            if not marker_source_type and params.get("cmaf", True):
+                if remote_uploaded:
+                    source_type = _remote_source_type(r2_path)
+                elif (local_output / "master.m3u8").exists():
                     source_type = "cmaf"
                 else:
                     try:
@@ -577,6 +645,18 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
             duration_for_register = int(video_duration) if video_duration else None
             if not duration_for_register and filepath and os.path.isfile(filepath):
                 duration_for_register = get_video_duration(filepath)
+
+            if upload_verified:
+                _put_upload_marker(
+                    r2_path,
+                    "uploaded",
+                    _upload_marker_payload(
+                        filepath, source_type, resolution or "原画",
+                        subtitles, duration_for_register,
+                    ),
+                    log,
+                )
+                _delete_upload_marker(r2_path, "uploading", log)
 
             register_error = [""]
 
@@ -603,6 +683,7 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
 
         if upload_verified:
             _put_upload_marker(r2_path, "ready", {"file": Path(filepath).name}, log)
+            _delete_upload_marker(r2_path, "uploaded", log)
             _delete_upload_marker(r2_path, "uploading", log)
         else:
             log("   ⚠️ 未执行上传校验，跳过 ready.json 标记")
