@@ -13,14 +13,18 @@ Cloudflare R2 配置自动推导
 from __future__ import annotations
 
 import hashlib
+import time
 from typing import Optional
 
 import httpx
 
 CF_API = "https://api.cloudflare.com/client/v4"
+CF_TIMEOUT_SECONDS = 30
+CF_RETRY_ATTEMPTS = 3
 
 
-def _cf_request(method: str, url: str, token_value: str, timeout: int = 15, **kwargs) -> httpx.Response:
+def _cf_request(method: str, url: str, token_value: str, timeout: int = CF_TIMEOUT_SECONDS,
+                **kwargs) -> httpx.Response:
     """
     调用 Cloudflare API。
 
@@ -38,38 +42,65 @@ def _cf_request(method: str, url: str, token_value: str, timeout: int = 15, **kw
     )
 
 
+def _response_json(resp: httpx.Response) -> dict:
+    try:
+        data = resp.json()
+        return data if isinstance(data, dict) else {}
+    except ValueError:
+        text = (resp.text or "").replace("\n", " ").strip()[:160]
+        return {"success": False, "errors": [f"非 JSON 响应: {text or resp.reason_phrase}"]}
+
+
+def _with_retry(action, what: str, log=print):
+    last_error = ""
+    for attempt in range(1, CF_RETRY_ATTEMPTS + 1):
+        try:
+            value, error = action()
+            if value:
+                if attempt > 1:
+                    log(f"   ✅ {what} 第 {attempt} 次重试成功")
+                return value
+            last_error = error or ""
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+        if attempt < CF_RETRY_ATTEMPTS:
+            log(f"   ⚠️ {what} 第 {attempt}/{CF_RETRY_ATTEMPTS} 次失败: {last_error}")
+            time.sleep(2 * attempt)
+    log(f"   ❌ {what} 失败: {last_error or '未知原因'}")
+    return None
+
+
 def derive_access_key(token_value: str) -> str:
     """Secret Access Key = SHA-256(token 明文)。"""
     return hashlib.sha256(token_value.encode("utf-8")).hexdigest()
 
 
-def verify_token(token_value: str, timeout: int = 15, log=print) -> Optional[str]:
+def verify_token(token_value: str, timeout: int = CF_TIMEOUT_SECONDS, log=print) -> Optional[str]:
     """
     校验 token 并返回其 id（即 Access Key ID）。失败返回 None。
     GET /user/tokens/verify
     """
-    try:
+    def _do():
         resp = _cf_request(
             "GET",
             f"{CF_API}/user/tokens/verify",
             token_value,
             timeout=timeout,
         )
-        data = resp.json()
+        data = _response_json(resp)
         if resp.status_code == 200 and data.get("success"):
-            return data.get("result", {}).get("id")
-        log(f"   ❌ CF Token 校验失败：HTTP {resp.status_code} {data.get('errors') or ''}")
-    except Exception as e:
-        log(f"   ❌ CF Token 校验异常：{type(e).__name__}: {e}")
-    return None
+            return data.get("result", {}).get("id"), ""
+        return None, f"HTTP {resp.status_code} {data.get('errors') or ''}"
+
+    return _with_retry(_do, "CF Token 校验", log=log)
 
 
-def get_account_id(token_value: str, timeout: int = 15, log=print) -> Optional[str]:
+def get_account_id(token_value: str, timeout: int = CF_TIMEOUT_SECONDS, log=print) -> Optional[str]:
     """
     获取账户 ID。优先取 token 可访问的第一个账户。
     GET /accounts
     """
-    try:
+    def _do():
         resp = _cf_request(
             "GET",
             f"{CF_API}/accounts",
@@ -77,45 +108,46 @@ def get_account_id(token_value: str, timeout: int = 15, log=print) -> Optional[s
             params={"per_page": 50},
             timeout=timeout,
         )
-        data = resp.json()
+        data = _response_json(resp)
         if resp.status_code == 200 and data.get("success"):
             results = data.get("result", [])
             if results:
-                return results[0].get("id")
-        log(f"   ❌ 获取账户 ID 失败：HTTP {resp.status_code} {data.get('errors') or ''}")
-    except Exception as e:
-        log(f"   ❌ 获取账户 ID 异常：{type(e).__name__}: {e}")
-    return None
+                return results[0].get("id"), ""
+            return None, "账号列表为空"
+        return None, f"HTTP {resp.status_code} {data.get('errors') or ''}"
+
+    return _with_retry(_do, "获取账户 ID", log=log)
 
 
-def list_buckets(token_value: str, account_id: str, timeout: int = 15, log=print) -> list[str]:
+def list_buckets(token_value: str, account_id: str, timeout: int = CF_TIMEOUT_SECONDS,
+                 log=print) -> list[str]:
     """
     列出账户下的 R2 桶名。
     GET /accounts/{account_id}/r2/buckets
     """
-    try:
+    def _do():
         resp = _cf_request(
             "GET",
             f"{CF_API}/accounts/{account_id}/r2/buckets",
             token_value,
             timeout=timeout,
         )
-        data = resp.json()
+        data = _response_json(resp)
         if resp.status_code == 200 and data.get("success"):
             buckets = data.get("result", {}).get("buckets", [])
-            return [b.get("name") for b in buckets if b.get("name")]
-        log(f"   ❌ 列出 R2 桶失败：HTTP {resp.status_code} {data.get('errors') or ''}")
-    except Exception as e:
-        log(f"   ❌ 列出 R2 桶异常：{type(e).__name__}: {e}")
-    return []
+            return [b.get("name") for b in buckets if b.get("name")], ""
+        return None, f"HTTP {resp.status_code} {data.get('errors') or ''}"
+
+    return _with_retry(_do, "列出 R2 桶", log=log) or []
 
 
-def create_bucket(token_value: str, account_id: str, name: str, timeout: int = 15, log=print) -> bool:
+def create_bucket(token_value: str, account_id: str, name: str,
+                  timeout: int = CF_TIMEOUT_SECONDS, log=print) -> bool:
     """
     创建 R2 桶。已存在或创建成功均返回 True。
     POST /accounts/{account_id}/r2/buckets
     """
-    try:
+    def _do():
         resp = _cf_request(
             "POST",
             f"{CF_API}/accounts/{account_id}/r2/buckets",
@@ -124,17 +156,16 @@ def create_bucket(token_value: str, account_id: str, name: str, timeout: int = 1
             timeout=timeout,
         )
         if resp.status_code in (200, 201):
-            return True
+            return True, ""
         # 已存在
-        data = resp.json()
+        data = _response_json(resp)
         for err in data.get("errors", []):
             # 10004: bucket already exists
             if err.get("code") == 10004 or "exist" in str(err.get("message", "")).lower():
-                return True
-        log(f"   ❌ 创建 R2 桶失败：HTTP {resp.status_code} {data.get('errors') or ''}")
-    except Exception as e:
-        log(f"   ❌ 创建 R2 桶异常：{type(e).__name__}: {e}")
-    return False
+                return True, ""
+        return None, f"HTTP {resp.status_code} {data.get('errors') or ''}"
+
+    return bool(_with_retry(_do, "创建 R2 桶", log=log))
 
 
 def auto_configure(token_value: str, prefer_bucket: str = "", create_if_missing: bool = False,
