@@ -4,7 +4,7 @@ R2 上传模块（插件内嵌版）
 import boto3
 from botocore.config import Config
 
-from .runtime_config import settings
+from .runtime_config import ConfigError, settings
 
 _BOTO_CONFIG = Config(proxies={})
 
@@ -27,6 +27,12 @@ _MIME_MAP = {
 
 def get_s3_client():
     """创建 R2 (S3 兼容) 客户端。"""
+    missing = settings.validate_r2()
+    if missing:
+        raise ConfigError(
+            "R2 配置缺失: " + "、".join(missing) +
+            "。请填写可自动配置的 CF API Token，或手动填写完整 R2 配置。"
+        )
     return boto3.client(
         "s3",
         endpoint_url=settings.R2_ENDPOINT,

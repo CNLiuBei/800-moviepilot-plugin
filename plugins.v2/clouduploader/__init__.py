@@ -43,7 +43,7 @@ class CloudUploader(_PluginBase):
     plugin_name = "云端自动上传"
     plugin_desc = "整理完成后自动切片(CMAF)→上传R2→入库到流媒体站，全流程在插件内完成。"
     plugin_icon = "upload.png"
-    plugin_version = "2.4.6"
+    plugin_version = "2.4.7"
     plugin_author = "cn"
     author_url = "https://github.com/CNLiuBei/800-moviepilot-plugin"
     plugin_config_prefix = "clouduploader_"
@@ -60,6 +60,7 @@ class CloudUploader(_PluginBase):
     _watch_dirs: List[str] = []
     _watch_delay = 20
     _scan_on_start = True
+    _config_ready = False
     _config: dict = {}
 
     # 二进制环境检测结果（由后台安装线程填充）
@@ -160,6 +161,13 @@ class CloudUploader(_PluginBase):
             tg_bot_token=config.get("tg_bot_token", ""),
             tg_chat_id=config.get("tg_chat_id", ""),
         )
+        missing = settings.validate()
+        self._config_ready = not missing
+        if self._enabled and missing:
+            logger.error(
+                "[CloudUploader] 配置缺失: " + "、".join(missing) +
+                "；已暂停上传、扫描和对账，请补齐配置后重新保存插件。"
+            )
 
         # 注入 MoviePilot 通知回调
         if self._notify:
@@ -168,7 +176,7 @@ class CloudUploader(_PluginBase):
             _notify_mod.set_mp_notifier(None)
 
         # 启动任务队列工作线程
-        if self._enabled:
+        if self._enabled and self._config_ready:
             self._start_worker()
             # 后台准备外部二进制（探测 ffmpeg/ffprobe），不阻塞插件加载
             threading.Thread(target=self._prepare_env, daemon=True).start()
@@ -239,6 +247,9 @@ class CloudUploader(_PluginBase):
     def _recover_tasks(self):
         """重启后把未完成（pending/running/error 且未超重投上限）的任务重新入队。"""
         time.sleep(20)  # 等环境准备
+        if not self._enabled or not self._config_ready:
+            logger.info("[CloudUploader] 配置未完整，跳过重启恢复任务")
+            return
         tasks = self._load_tasks()
         recovered = 0
         changed = False
@@ -265,7 +276,7 @@ class CloudUploader(_PluginBase):
 
     def reconcile(self):
         """定时对账兜底：重投持久化中仍未成功、且未超重投上限的任务（由 get_service 调度）。"""
-        if not self._enabled:
+        if not self._enabled or not self._config_ready:
             return
         tasks = self._load_tasks()
         requeued = 0
@@ -283,7 +294,7 @@ class CloudUploader(_PluginBase):
     def _scan_library_on_start(self):
         """插件启动后延迟扫描一次，补齐实时监控启动前已存在的媒体文件。"""
         time.sleep(max(30, self._delay + 10))
-        if self._enabled:
+        if self._enabled and self._config_ready:
             logger.info("[CloudUploader] 启动扫描：检查媒体库漏传文件")
             self.scan_library()
 
@@ -413,6 +424,13 @@ class CloudUploader(_PluginBase):
         返回 True 表示成功入队，False 表示因重复被跳过。
         """
         key = self._task_key(params)
+        if not self._config_ready:
+            missing = settings.validate()
+            error = "配置缺失: " + "、".join(missing)
+            logger.warning(f"[CloudUploader] {error}，跳过入队: {key}")
+            if record:
+                self._record_task(key, params, "error", error=error, stage="precheck")
+            return False
         with self._inflight_lock:
             if key in self._inflight:
                 logger.info(f"[CloudUploader] 任务已在队列/执行中，跳过重复入队: {key}")
@@ -483,18 +501,22 @@ class CloudUploader(_PluginBase):
     def api_scan_library(self) -> dict:
         if not self._enabled:
             return {"success": False, "message": "插件未启用"}
+        if not self._config_ready:
+            return {"success": False, "message": "配置缺失: " + "、".join(settings.validate())}
         threading.Thread(target=self.scan_library, daemon=True).start()
         return {"success": True, "message": "已开始后台扫描"}
 
     def api_reconcile(self) -> dict:
         if not self._enabled:
             return {"success": False, "message": "插件未启用"}
+        if not self._config_ready:
+            return {"success": False, "message": "配置缺失: " + "、".join(settings.validate())}
         threading.Thread(target=self.reconcile, daemon=True).start()
         return {"success": True, "message": "已开始后台对账"}
 
     def get_service(self) -> List[Dict[str, Any]]:
         """注册定时服务：对账兜底 + 媒体库目录扫描补传。"""
-        if not self._enabled:
+        if not self._enabled or not self._config_ready:
             return []
         interval = int(self._config.get("reconcile_interval") or 30)
         scan_interval = int(self._config.get("scan_interval") or 0)
@@ -657,7 +679,8 @@ class CloudUploader(_PluginBase):
 
     def _handle_watch_event(self, event):
         """接收 watchdog 事件并做防抖，避免文件写入过程中反复触发。"""
-        if not self._enabled or not self._watch_enabled or getattr(event, "is_directory", False):
+        if (not self._enabled or not self._config_ready or not self._watch_enabled
+                or getattr(event, "is_directory", False)):
             return
         path = getattr(event, "dest_path", None) or getattr(event, "src_path", None)
         if not path or Path(path).suffix.lower() not in self._MEDIA_EXTS:
@@ -688,6 +711,9 @@ class CloudUploader(_PluginBase):
         """目录监控触发后，等待文件稳定并尝试按整理历史入队。"""
         with self._watch_lock:
             self._watch_timers.pop(filepath, None)
+        if not self._config_ready:
+            logger.warning(f"[CloudUploader] 配置缺失，目录监控跳过: {filepath}")
+            return
 
         if not self._is_file_stable(filepath):
             logger.info(f"[CloudUploader] 监控文件尚未稳定，延后处理: {filepath}")
@@ -723,7 +749,7 @@ class CloudUploader(_PluginBase):
         4. 用 R2 head_object 检查 master.m3u8/stream.m3u8 是否存在
         5. 不存在且任务记录中没有 success → 入队补传
         """
-        if not self._enabled:
+        if not self._enabled or not self._config_ready:
             return
 
         logger.info("[CloudUploader] 开始扫描媒体库目录...")
@@ -1096,7 +1122,7 @@ class CloudUploader(_PluginBase):
         # R2 来源说明
         if self._cf_derived:
             env_lines.append(f"R2: ✅ 由 CF Token 自动配置（账户 {self._cf_derived.get('account_id','')[:8]}…，桶 {settings.R2_BUCKET}）")
-        elif settings.R2_ACCESS_KEY_ID:
+        elif not settings.validate_r2():
             env_lines.append(f"R2: 手动配置（桶 {settings.R2_BUCKET}）")
         if self._watch_enabled:
             watch_dirs = self._get_watch_dirs()
@@ -1281,6 +1307,9 @@ class CloudUploader(_PluginBase):
         if self._delay > 0:
             logger.info(f"[CloudUploader] 等待 {self._delay}s...")
             time.sleep(self._delay)
+        if not self._config_ready:
+            logger.warning(f"[CloudUploader] 配置缺失，跳过上传入队: {Path(filepath).name}")
+            return
 
         if not os.path.isfile(filepath):
             logger.warning(f"[CloudUploader] 文件不存在，跳过: {filepath}")

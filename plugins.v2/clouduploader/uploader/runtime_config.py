@@ -90,6 +90,8 @@ class _Settings:
 
     @property
     def R2_ENDPOINT(self) -> str:
+        if not self.R2_ACCOUNT_ID:
+            raise ConfigError("R2 账户 ID 缺失，无法生成 R2 endpoint")
         return f"https://{self.R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 
     def configure(self, **kwargs) -> None:
@@ -110,10 +112,12 @@ class _Settings:
                         continue
                 elif key_upper == "API_BASE":
                     value = normalize_base_url(value, "流媒体站地址")
+                elif isinstance(cur, str):
+                    value = str(value).strip()
                 setattr(self, key_upper, value)
 
-    def validate(self) -> list[str]:
-        """返回缺失的必填项列表（空列表表示配置完整）。"""
+    def validate_r2(self) -> list[str]:
+        """返回 R2 上传所需缺失项。"""
         missing = []
         if not self.R2_ACCOUNT_ID:
             missing.append("R2 账户 ID")
@@ -121,6 +125,13 @@ class _Settings:
             missing.append("R2 Access Key")
         if not self.R2_SECRET_ACCESS_KEY:
             missing.append("R2 Secret Key")
+        if not self.R2_BUCKET:
+            missing.append("R2 Bucket")
+        return missing
+
+    def validate(self) -> list[str]:
+        """返回缺失的必填项列表（空列表表示配置完整）。"""
+        missing = self.validate_r2()
         if not self.TMDB_TOKEN:
             missing.append("TMDB Token")
         if not self.API_BASE:

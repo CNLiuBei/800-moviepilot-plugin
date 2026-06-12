@@ -443,6 +443,12 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
         return {"status": "error", "error": error, "r2_path": r2_path, "stage": stage}
 
     try:
+        missing_config = settings.validate()
+        if missing_config:
+            msg = "配置缺失: " + "、".join(missing_config)
+            log(f"❌ {msg}，已停止任务，避免切片后上传失败")
+            return {"status": "error", "error": msg, "r2_path": None, "stage": "precheck"}
+
         filepath = params["filepath"]
         if not os.path.isfile(filepath):
             log(f"❌ 文件不存在: {filepath}")
