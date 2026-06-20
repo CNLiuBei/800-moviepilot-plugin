@@ -2,7 +2,7 @@
 """
 Backfill Apple-compatible HLS WebVTT subtitle tracks for uploaded R2 videos.
 
-Discovery uses the configured Guangying movie API, then object writes use Wrangler.
+Discovery uses the configured Guangying TMDB mirror API, then object writes use Wrangler.
 Set CLOUDFLARE_API_TOKEN and GY_SITE_URL (or pass --site-url) before running.
 """
 from __future__ import annotations
@@ -128,35 +128,37 @@ def object_key_from_source(url: str) -> str | None:
     return url
 
 
-def movie_slugs(site_url: str, page_size: int, max_pages: int):
+def tmdb_items(site_url: str, media_type: str, page_size: int, max_pages: int):
     page = 1
     while True:
         if max_pages and page > max_pages:
             break
-        data = fetch_json(f"{site_url}/api/movies?page={page}&pageSize={page_size}", site_url)
-        items = data.get("items") or []
-        print(f"discover page {page}: {len(items)} items", flush=True)
+        data = fetch_json(f"{site_url}/3/discover/{media_type}?page={page}", site_url)
+        items = data.get("results") or []
+        print(f"discover {media_type} page {page}: {len(items)} items", flush=True)
         if not items:
             break
-        for item in items:
-            slug = item.get("slug")
-            if slug:
-                yield slug
+        for item in items[:page_size]:
+            tmdb_id = item.get("id")
+            if isinstance(tmdb_id, int) and tmdb_id > 0:
+                yield media_type, tmdb_id
         page += 1
 
 
 def discover_r2_dirs(site_url: str, page_size: int, max_pages: int) -> list[str]:
     dirs: set[str] = set()
-    for slug in movie_slugs(site_url, page_size, max_pages):
-        try:
-            detail = fetch_json(f"{site_url}/api/movies/{quote(slug)}", site_url)
-        except (HTTPError, URLError, TimeoutError) as exc:
-            print(f"skip {slug}: detail failed: {exc}")
-            continue
-        for source in detail.get("sources") or []:
-            key = object_key_from_source(source.get("url", ""))
-            if key:
-                dirs.add(key.rsplit("/", 1)[0])
+    for media_type in ("movie", "tv"):
+        for item_media_type, tmdb_id in tmdb_items(site_url, media_type, page_size, max_pages):
+            try:
+                detail = fetch_json(f"{site_url}/3/{item_media_type}/{tmdb_id}", site_url)
+            except (HTTPError, URLError, TimeoutError) as exc:
+                print(f"skip tmdb:{item_media_type}:{tmdb_id}: detail failed: {exc}")
+                continue
+            guangying = detail.get("guangying") or {}
+            for source in guangying.get("play_sources") or []:
+                key = object_key_from_source(source.get("url", ""))
+                if key:
+                    dirs.add(key.rsplit("/", 1)[0])
     return sorted(dirs)
 
 

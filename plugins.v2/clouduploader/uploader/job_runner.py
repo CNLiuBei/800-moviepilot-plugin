@@ -21,7 +21,7 @@ from urllib.parse import unquote, urlparse
 
 from .runtime_config import settings
 from .parser import parse_filename
-from .slicer import cmaf_demux_slice, get_video_duration
+from .slicer import apple_hls_slice, get_video_duration
 from .subtitles import extract_subtitles, generate_hls_subtitle_playlists
 from .register import auto_register, write_episode_nfo, write_show_nfo
 from .notify import notify_upload_success, notify_upload_failed
@@ -64,49 +64,55 @@ def retry(fn, attempts: int = 3, base_delay: float = 3.0, log=print, what: str =
     return False, None
 
 
-# ─── R2 上传 (跳过已存在的同尺寸文件) ───
+# ─── R2 上传（覆盖目标前缀，避免历史残留）───
+
+_UPLOAD_MARKER_FILES = {"uploading.json", "uploaded.json", "ready.json"}
+_UPLOAD_MARKERS_TO_KEEP_WHILE_UPLOADING = {"uploading.json"}
+
+
+def _list_r2_prefix(s3, r2_prefix: str) -> dict[str, int]:
+    existing: dict[str, int] = {}
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=settings.R2_BUCKET, Prefix=r2_prefix + "/"):
+        for obj in page.get("Contents", []):
+            rel = obj["Key"][len(r2_prefix) + 1:]
+            if rel:
+                existing[rel] = obj["Size"]
+    return existing
+
+
+def _delete_r2_objects(s3, keys: list[str]) -> int:
+    deleted = 0
+    for i in range(0, len(keys), 1000):
+        batch = keys[i:i + 1000]
+        response = s3.delete_objects(
+            Bucket=settings.R2_BUCKET,
+            Delete={"Objects": [{"Key": key} for key in batch]},
+        )
+        errors = response.get("Errors") or []
+        if errors:
+            failed_keys = ", ".join(str(item.get("Key", "")) for item in errors[:5])
+            raise RuntimeError(f"R2 旧文件删除失败: {failed_keys}")
+        deleted += len(batch)
+    return deleted
 
 def upload_directory_smart(local_dir: Path, r2_prefix: str, on_progress, cancel_check,
                            force_overwrite: bool = False) -> tuple[int, int]:
-    """智能上传: 跳过已存在且大小相同的文件。返回 (uploaded, skipped)。"""
+    """覆盖上传: 先清空目标前缀旧对象，再上传本地目录全部文件。返回 (uploaded, deleted)。"""
     s3 = get_s3_client()
     files = [f for f in local_dir.rglob("*") if f.is_file()]
     if not files:
         return 0, 0
 
-    existing: dict[str, int] = {}
-    paginator = s3.get_paginator("list_objects_v2")
-    try:
-        for page in paginator.paginate(Bucket=settings.R2_BUCKET, Prefix=r2_prefix + "/"):
-            for obj in page.get("Contents", []):
-                rel = obj["Key"][len(r2_prefix) + 1:]
-                existing[rel] = obj["Size"]
-    except Exception:
-        pass
-
-    if force_overwrite and existing:
-        keys_to_delete = [f"{r2_prefix}/{rel}" for rel in existing.keys() if rel != "uploading.json"]
-        for i in range(0, len(keys_to_delete), 1000):
-            batch = keys_to_delete[i:i + 1000]
-            try:
-                s3.delete_objects(
-                    Bucket=settings.R2_BUCKET,
-                    Delete={"Objects": [{"Key": k} for k in batch]},
-                )
-            except Exception:
-                pass
-        existing.clear()
-
-    pending_files = [
-        f for f in files
-        if force_overwrite or existing.get(str(f.relative_to(local_dir)).replace("\\", "/")) != f.stat().st_size
+    existing = _list_r2_prefix(s3, r2_prefix)
+    keys_to_delete = [
+        f"{r2_prefix}/{rel}"
+        for rel in existing.keys()
+        if rel not in _UPLOAD_MARKERS_TO_KEEP_WHILE_UPLOADING
     ]
-    if not pending_files:
-        on_progress(1, 0, 0)
-        return 0, len(files)
+    deleted = _delete_r2_objects(s3, keys_to_delete) if keys_to_delete else 0
 
     uploaded = 0
-    skipped = 0
     failed = 0
     total = len(files)
     total_bytes = sum(f.stat().st_size for f in files)
@@ -117,15 +123,13 @@ def upload_directory_smart(local_dir: Path, r2_prefix: str, on_progress, cancel_
     def upload_one(f: Path) -> tuple[str, int]:
         rel_key = str(f.relative_to(local_dir)).replace("\\", "/")
         local_size = f.stat().st_size
-        if not force_overwrite and existing.get(rel_key) == local_size:
-            return "skip", local_size
         key = f"{r2_prefix}/{rel_key}"
         ct = _MIME_MAP.get(f.suffix.lower(), "application/octet-stream")
         s3.upload_file(str(f), settings.R2_BUCKET, key, ExtraArgs={"ContentType": ct})
         return "ok", local_size
 
     def upload_phase(phase_files: list[Path]) -> None:
-        nonlocal uploaded, skipped, failed, uploaded_bytes, completed_files
+        nonlocal uploaded, failed, uploaded_bytes, completed_files
         if not phase_files:
             return
         with ThreadPoolExecutor(max_workers=settings.UPLOAD_CONCURRENCY) as pool:
@@ -136,9 +140,7 @@ def upload_directory_smart(local_dir: Path, r2_prefix: str, on_progress, cancel_
                 try:
                     r, size = fut.result()
                     uploaded_bytes += size
-                    if r == "skip":
-                        skipped += 1
-                    else:
+                    if r == "ok":
                         uploaded += 1
                 except Exception as e:
                     failed += 1
@@ -167,11 +169,26 @@ def upload_directory_smart(local_dir: Path, r2_prefix: str, on_progress, cancel_
     if not cancel_check() and failed == 0:
         upload_phase(master_manifests)
 
-    # 有文件上传失败：抛异常让上层 retry 重投（已成功的同尺寸文件下次会被跳过，只补失败部分）
+    # 有文件上传失败：抛异常让上层 retry；重试会重新覆盖目标前缀，避免半成品残留。
     if failed:
         raise RuntimeError(f"{failed} 个文件上传失败（共 {total} 个），需重试补传")
 
-    return uploaded, skipped
+    local_rels = {rel_name(f) for f in files}
+    remote_rels = {
+        rel for rel in _list_r2_prefix(s3, r2_prefix).keys()
+        if rel not in _UPLOAD_MARKER_FILES
+    }
+    extra = sorted(remote_rels - local_rels)
+    missing = sorted(local_rels - remote_rels)
+    if extra or missing:
+        details = []
+        if extra:
+            details.append("多余: " + ", ".join(extra[:5]))
+        if missing:
+            details.append("缺失: " + ", ".join(missing[:5]))
+        raise RuntimeError("R2 覆盖上传校验失败（" + "；".join(details) + "）")
+
+    return uploaded, deleted
 
 
 def _upload_marker_payload(
@@ -294,7 +311,7 @@ def _assert_fmp4_playlist_has_map(playlist: Path) -> None:
         for line in text.splitlines()
         if line.strip() and not line.strip().startswith("#")
     ]
-    references_fmp4 = any(line.endswith(".m4s") for line in media_lines)
+    references_fmp4 = any(urlparse(line).path.endswith(".m4s") for line in media_lines)
     if references_fmp4 and "#EXT-X-MAP:" not in text:
         raise RuntimeError(f"fMP4 播放清单缺少 EXT-X-MAP: {playlist.name}")
 
@@ -390,11 +407,34 @@ def _generate_manifests(output_dir: Path, cmaf_result: dict, log, subtitles_info
     from .manifest import generate_hls_master, generate_dash_mpd, validate_hls_media_playlists
 
     generate_hls_master(cmaf_result, output_dir, print_fn=lambda x: None, subtitles_info=subtitles_info)
+    if cmaf_result.get("appleHLS"):
+        _validate_with_apple_tool(output_dir / "master.m3u8", log)
+        return
     try:
         playlist_info = validate_hls_media_playlists(output_dir, print_fn=lambda x: None)
         generate_dash_mpd(cmaf_result, playlist_info, output_dir, print_fn=lambda x: None)
     except Exception as e:
         log(f"[manifest] MPD 生成失败 ({output_dir.name}): {e}")
+
+
+def _validate_with_apple_tool(master_playlist: Path, log) -> None:
+    validator = shutil.which(settings.MEDIASTREAMVALIDATOR_BIN)
+    if not validator and os.path.isabs(settings.MEDIASTREAMVALIDATOR_BIN) and os.path.isfile(settings.MEDIASTREAMVALIDATOR_BIN):
+        validator = settings.MEDIASTREAMVALIDATOR_BIN
+    if not validator:
+        log("   ⚠️ mediastreamvalidator 未安装，跳过 Apple 官方校验")
+        return
+    result = subprocess.run(
+        [validator, str(master_playlist)],
+        capture_output=True,
+        text=True,
+        timeout=1800,
+        cwd=str(master_playlist.parent),
+    )
+    output = "\n".join(part for part in [result.stdout, result.stderr] if part)
+    if result.returncode != 0:
+        raise RuntimeError(f"Apple HLS 校验失败:\n{output[-1000:]}")
+    log("   ✅ Apple mediastreamvalidator 校验通过")
 
 
 # ─── 单任务执行 ───
@@ -465,6 +505,9 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
         remote_uploaded = bool(params.get("remote_uploaded"))
         has_remote_marker = bool(params.get("remote_uploaded_marker"))
         remote_marker = _read_upload_marker(r2_path, "uploaded", log) if has_remote_marker else {}
+        if not remote_uploaded and not params.get("skip_slice") and local_output.exists():
+            shutil.rmtree(local_output, ignore_errors=True)
+            log(f"🧹 已清理旧本地输出: {local_output}")
 
         # ─── 字幕（切片前提取，避免源文件被移动）───
         subtitles = []
@@ -489,7 +532,6 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
             if subtitles:
                 for sub in subtitles:
                     log(f"   字幕 [{sub['lang']}] {sub['label']}")
-                subtitles_info = generate_hls_subtitle_playlists(subtitles, local_output, print_fn=log)
             else:
                 log("   无内嵌字幕")
 
@@ -512,59 +554,42 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
                 # 检查本身失败不应阻断流程，仅记录
                 log(f"   ⚠️ 磁盘空间检查跳过: {e}")
 
-            use_cmaf = params.get("cmaf", True)
+            log("🎬 Apple HLS 切片 (官方工具)...")
+            start = time.time()
 
-            if use_cmaf:
-                log("🎬 CMAF 切片 (音视频分离)...")
-                start = time.time()
+            def _do_apple_hls():
+                result = apple_hls_slice(filepath, local_output, print_fn=log)
+                if result:
+                    log("   使用 Apple HLS Tools 生成原生播放清单")
+                return result
 
-                def _do_cmaf():
-                    # FFmpeg CMAF demux 切片：音视频分离 fMP4，视频流 -c:v copy 无损直切，
-                    # 兼容 HEVC/MKV 等容器，无需转码。
-                    log("   使用 FFmpeg CMAF (音视频分离)")
-                    return cmaf_demux_slice(filepath, local_output, print_fn=log)
+            # 切片失败重试（少量次数，切片多为确定性失败，重试主要应对偶发 I/O）
+            ok_slice, cmaf_result = retry(
+                _do_apple_hls, attempts=max(2, min(attempts, 2)), base_delay=2.0,
+                log=log, what="Apple HLS 切片", cancel_check=cancel_check)
 
-                # 切片失败重试（少量次数，切片多为确定性失败，重试主要应对偶发 I/O）
-                ok_slice, cmaf_result = retry(
-                    _do_cmaf, attempts=max(2, min(attempts, 2)), base_delay=2.0,
-                    log=log, what="CMAF 切片", cancel_check=cancel_check)
+            if cancel_check():
+                return {"status": "cancelled", "error": None, "r2_path": r2_path}
+            if not cmaf_result:
+                return _fail("slice", "Apple HLS 切片失败", r2_path)
 
-                if cancel_check():
-                    return {"status": "cancelled", "error": None, "r2_path": r2_path}
-                if not cmaf_result:
-                    log("⚠️ CMAF 切片失败，回退到 HLS 模式...")
-                    use_cmaf = False
-                else:
-                    v_segs = len(cmaf_result["videoSegments"])
-                    a_segs = len(cmaf_result["audioSegments"])
-                    video_duration = cmaf_result.get("duration") or None
-                    sz = sum(f.stat().st_size for f in local_output.rglob("*") if f.is_file()) / (1024**3)
-                    log(f"   ✅ 视频 {v_segs} 片段 + 音频 {a_segs} 片段, {sz:.2f} GB, {time.time()-start:.1f}s")
-                    log(f"   编码: {cmaf_result['videoCodec']} + {cmaf_result['audioCodec']}")
-                    if subtitles_info or not (local_output / "master.m3u8").exists():
-                        log("📋 生成 HLS master + DASH MPD...")
-                        _generate_manifests(local_output, cmaf_result, log, subtitles_info=subtitles_info)
-                    log("   ✅ master.m3u8 已就绪")
-
-            if not use_cmaf:
-                log("🎬 HLS 切片 (回退模式)...")
-                start = time.time()
-                ok = _hls_slice(filepath, local_output, cancel_check, log)
-                if cancel_check():
-                    return {"status": "cancelled", "error": None, "r2_path": r2_path}
-                if not ok:
-                    log("❌ 切片失败")
-                    return _fail("slice", "切片失败", r2_path)
-                segs = list(local_output.glob("seg-*.m4s"))
-                sz = sum(f.stat().st_size for f in local_output.rglob("*") if f.is_file()) / (1024**3)
-                log(f"   ✅ {len(segs)} 片段, {sz:.2f} GB, {time.time()-start:.1f}s")
-
+            v_segs = len(cmaf_result["videoSegments"])
+            video_duration = cmaf_result.get("duration") or None
+            sz = sum(f.stat().st_size for f in local_output.rglob("*") if f.is_file()) / (1024**3)
+            log(f"   ✅ Apple HLS {v_segs} 片段, {sz:.2f} GB, {time.time()-start:.1f}s")
+            log(f"   编码: {cmaf_result['videoCodec']} + {cmaf_result['audioCodec']}")
+            if subtitles and not subtitles_info:
+                subtitles_info = generate_hls_subtitle_playlists(subtitles, local_output, print_fn=log)
+            if subtitles_info or not (local_output / "master.m3u8").exists():
+                log("📋 生成 HLS master + DASH MPD...")
+                _generate_manifests(local_output, cmaf_result, log, subtitles_info=subtitles_info)
+            log("   ✅ master.m3u8 已就绪")
         # ─── 上传 ───
         if not params.get("skip_upload") and not remote_uploaded:
             if cancel_check():
                 return {"status": "cancelled", "error": None, "r2_path": r2_path}
             force_overwrite = params.get("force_overwrite", False)
-            log("📤 强制重新上传 R2 (覆盖旧数据)..." if force_overwrite else "📤 上传 R2 (检查重复)...")
+            log("📤 覆盖上传 R2 (清理旧文件)...")
             start = time.time()
             _put_upload_marker(r2_path, "uploading", {"file": Path(filepath).name}, log)
 
@@ -578,11 +603,11 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
                     eta_str = f" | ETA {int(eta)}s" if eta > 0 else ""
                     log(f"   上传 {int(p*100)}%  ({time.time()-start:.1f}s, {speed_mb:.1f} MB/s{eta_str})")
 
-            # 上传可重试：upload_directory_smart 会跳过已传的同尺寸文件，重试只补缺失部分
+            # 覆盖上传：每次先清理目标前缀旧对象，再完整上传本地目录，避免 R2 残留多余文件。
             def _do_upload():
-                up, sk = upload_directory_smart(
+                up, deleted = upload_directory_smart(
                     local_output, r2_path, upload_progress, cancel_check, force_overwrite=force_overwrite)
-                return {"uploaded": up, "skipped": sk}
+                return {"uploaded": up, "deleted": deleted}
 
             ok_up, up_res = retry(
                 _do_upload, attempts=attempts, base_delay=5.0,
@@ -591,8 +616,8 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
                 return {"status": "cancelled", "error": None, "r2_path": r2_path}
             if not ok_up:
                 return _fail("upload", "R2 上传失败", r2_path)
-            log(f"   ✅ 新上传 {up_res['uploaded']}, 跳过 {up_res['skipped']} (已存在), {time.time()-start:.1f}s")
-            log("   ✅ 上传完成，跳过 R2 完整性校验，继续入库")
+            log(f"   ✅ 覆盖上传 {up_res['uploaded']} 个文件，清理旧文件 {up_res['deleted']} 个，{time.time()-start:.1f}s")
+            log("   ✅ R2 对象集合校验通过，继续入库")
             upload_verified = True
         elif remote_uploaded:
             try:
@@ -617,7 +642,7 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
         if not params.get("skip_register"):
             marker_source_type = str(remote_marker.get("sourceType") or "")
             source_type = marker_source_type if marker_source_type in {"cmaf", "hls"} else "hls"
-            if not marker_source_type and params.get("cmaf", True):
+            if not marker_source_type:
                 if remote_uploaded:
                     source_type = _remote_source_type(r2_path)
                 elif (local_output / "master.m3u8").exists():
@@ -714,34 +739,3 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
             shutil.rmtree(local_output, ignore_errors=True)
             log(f"🧹 异常清理本地切片: {local_output}")
         return {"status": "error", "error": str(e), "r2_path": None, "stage": "exception"}
-
-
-# ─── 传统 HLS 切片 (回退模式) ───
-
-def _hls_slice(input_path: str, output_dir: Path, cancel_check, log) -> bool:
-    """传统单文件 HLS fMP4 切片（音视频合一），CMAF 失败时回退用。"""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    m3u8_path = output_dir / "stream.m3u8"
-    seg_pattern = str(output_dir / "seg-%05d.m4s")
-    cmd = [
-        settings.FFMPEG_BIN, "-i", input_path,
-        "-map", "0:v:0", "-map", "0:a:0",
-        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ac", "2",
-        "-hls_time", str(settings.HLS_SEGMENT_SECONDS), "-hls_list_size", "0",
-        "-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4",
-        "-hls_flags", "independent_segments",
-        "-hls_segment_filename", seg_pattern,
-        str(m3u8_path), "-y",
-    ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    deadline = time.time() + 3600  # 最长 1 小时，防止 ffmpeg 卡死导致 worker 永久阻塞
-    while proc.poll() is None:
-        if cancel_check():
-            proc.kill()
-            return False
-        if time.time() > deadline:
-            proc.kill()
-            log("❌ HLS 切片超时（>1h），已终止")
-            return False
-        time.sleep(1)
-    return proc.returncode == 0

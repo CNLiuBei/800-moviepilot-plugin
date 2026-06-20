@@ -13,6 +13,30 @@ _HTTPX_REQUEST_KWARGS = {"trust_env": False}
 _TMDB_NFO_TIMEOUT = 5
 
 
+def _upload_tmdb_image(path: str, size: str, r2_key: str, print_fn, label: str) -> None:
+    if not path:
+        return
+    try:
+        img = httpx.get(
+            f"https://image.tmdb.org/t/p/{size}{path}",
+            timeout=_TMDB_NFO_TIMEOUT,
+            follow_redirects=True,
+            **_HTTPX_REQUEST_KWARGS,
+        )
+        if img.status_code != 200:
+            print_fn(f"   ⚠️ {label} 下载失败: HTTP {img.status_code}")
+            return
+        get_s3_client().put_object(
+            Bucket=settings.R2_BUCKET,
+            Key=r2_key,
+            Body=img.content,
+            ContentType="image/jpeg",
+        )
+        print_fn(f"   ✅ {label} ({len(img.content) // 1024} KB)")
+    except Exception as e:
+        print_fn(f"   ⚠️ {label}: {e}")
+
+
 def _api_error(resp: httpx.Response, prefix: str) -> str:
     """从 API 响应中提取可读错误信息。"""
     try:
@@ -157,8 +181,8 @@ def _do_register(
         else f"/api/r2/{r2_path}/stream.m3u8"
     )
 
-    # 首次轻量导入（不拉全季分集，避免每集重复打 TMDB）；失败再拉全量分集重试。
-    ok, err = _import_tmdb(client, tmdb_id, media_type, fetch_episodes=False, print_fn=print_fn)
+    # TV/动漫：导入时同步全部分集，保证详情页剧集列表可用
+    ok, err = _import_tmdb(client, tmdb_id, media_type, fetch_episodes=(media_type == "tv"), print_fn=print_fn)
     if not ok:
         return False, err
 
@@ -416,14 +440,29 @@ def write_show_nfo(tmdb_id: int, media_type: str, print_fn=None):
         cast = (d.get("credits", {}).get("cast", []))[:15]
         for a in cast:
             lines.append(f"  <actor><name>{esc(a['name'])}</name><role>{esc(a.get('character', ''))}</role></actor>")
+        poster_path = d.get("poster_path") or ""
+        backdrop_path = d.get("backdrop_path") or ""
+        if poster_path:
+            lines.append(f"  <thumb>https://image.tmdb.org/t/p/w500{poster_path}</thumb>")
+        if backdrop_path:
+            lines.append(f"  <fanart>https://image.tmdb.org/t/p/w1280{backdrop_path}</fanart>")
         lines.append(f"</{root}>")
 
         nfo_name = "tvshow.nfo" if media_type == "tv" else "movie.nfo"
+        r2_base = f"tmdb/{media_type}/{tmdb_id}"
         s3 = get_s3_client()
         s3.put_object(
-            Bucket=settings.R2_BUCKET, Key=f"tmdb/{media_type}/{tmdb_id}/{nfo_name}",
+            Bucket=settings.R2_BUCKET, Key=f"{r2_base}/{nfo_name}",
             Body="\n".join(lines).encode("utf-8"), ContentType="application/xml",
         )
         print_fn(f"   ✅ {nfo_name}")
+        _upload_tmdb_image(
+            poster_path, "w500", f"{r2_base}/poster.jpg", print_fn,
+            label="poster.jpg",
+        )
+        _upload_tmdb_image(
+            backdrop_path, "w1280", f"{r2_base}/fanart.jpg", print_fn,
+            label="fanart.jpg",
+        )
     except Exception as e:
         print_fn(f"   ⚠️ show nfo: {e}")

@@ -204,15 +204,18 @@ def generate_hls_master(slice_result: dict, output_dir: Path, print_fn=None, sub
     width = slice_result["width"]
     height = slice_result["height"]
     audio_tracks = slice_result.get("audioTracks", [])
+    is_apple_hls = bool(slice_result.get("appleHLS"))
 
     lines = [
         "#EXTM3U",
         "#EXT-X-VERSION:7",
         "#EXT-X-INDEPENDENT-SEGMENTS",
-        "",
     ]
+    lines.append("")
 
-    if audio_tracks and len(audio_tracks) > 1:
+    if is_apple_hls:
+        pass
+    elif audio_tracks and len(audio_tracks) > 1:
         # 多音轨: 每个音轨一个 EXT-X-MEDIA 条目
         _LANG_NAMES = {
             'zho': '国语', 'chi': '国语', 'cmn': '国语', 'zh': '国语',
@@ -248,30 +251,36 @@ def generate_hls_master(slice_result: dict, output_dir: Path, print_fn=None, sub
 
     # 字幕轨
     if subtitles_info:
+        autoselected_langs: set[str] = set()
         for i, sub in enumerate(subtitles_info):
             is_default = "YES" if i == 0 else "NO"
+            lang = str(sub["lang"])
+            is_autoselect = "NO"
+            if lang not in autoselected_langs:
+                is_autoselect = "YES"
+                autoselected_langs.add(lang)
             lines.append(
-                f'#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",LANGUAGE="{_hls_attr(sub["lang"])}",'
-                f'NAME="{_hls_attr(sub["name"])}",DEFAULT={is_default},AUTOSELECT=YES,FORCED=NO,URI="{_hls_attr(sub["uri"])}"'
+                f'#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",LANGUAGE="{_hls_attr(lang)}",'
+                f'NAME="{_hls_attr(sub["name"])}",DEFAULT={is_default},AUTOSELECT={is_autoselect},'
+                f'FORCED=NO,URI="{_hls_attr(sub["uri"])}"'
             )
         lines.append("")
 
     stream_attrs = [
         f"BANDWIDTH={int(bandwidth)}",
-        f"AVERAGE-BANDWIDTH={int(average_bandwidth)}",
         f'CODECS="{_hls_attr(f"{vcodec},{acodec}")}"',
         f"RESOLUTION={width}x{height}",
     ]
+    if not is_apple_hls:
+        stream_attrs.insert(1, f"AVERAGE-BANDWIDTH={int(average_bandwidth)}")
     if frame_rate > 0:
         stream_attrs.append(f"FRAME-RATE={frame_rate:.3f}".rstrip("0").rstrip("."))
-    stream_attrs.extend([
-        'AUDIO="audio"',
-        'CLOSED-CAPTIONS="NONE"',
-    ])
+    if not is_apple_hls:
+        stream_attrs.append('AUDIO="audio"')
     if subtitles_info:
         stream_attrs.append('SUBTITLES="subs"')
     lines.append(f"#EXT-X-STREAM-INF:{','.join(stream_attrs)}")
-    lines.append("stream-v.m3u8")
+    lines.append(slice_result.get("hlsVideo", "stream-v.m3u8"))
 
     content = "\n".join(lines) + "\n"
     master_path = output_dir / "master.m3u8"

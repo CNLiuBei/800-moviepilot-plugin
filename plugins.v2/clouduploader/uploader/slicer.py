@@ -1,47 +1,22 @@
 """
-FFmpeg CMAF Demux 切片模块（插件内嵌版）
-将源视频分离为独立的视频轨和音频轨 fMP4 片段。
+Apple HLS 切片模块（插件内嵌版）。
+
+FFmpeg/ffprobe 仅用于源文件探测与生成 Apple HLS Tools 可处理的中间 MP4。
 """
 import json
 import math
-import re
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 from .runtime_config import settings
 
-# 不兼容 fMP4 容器的编码 (需要转码)
-_INCOMPATIBLE_CODECS = frozenset({
-    'vp9', 'vp8', 'av1', 'theora', 'mpeg2video', 'mpeg1video', 'rawvideo',
-})
+_COPYABLE_VIDEO_CODECS = frozenset({"h264", "hevc", "h265"})
 
 
-def _fix_target_duration(playlist_path: Path) -> None:
-    """
-    修正 FFmpeg 写出的 #EXT-X-TARGETDURATION。
-
-    FFmpeg 用 round() 计算 TARGETDURATION，当存在 X.5 以上的超长片段时
-    （如 8.2s → round=8），会写出小于实际最大片段时长的值，违反 HLS 规范
-    （RFC 8216 要求 TARGETDURATION >= ceil(max segment duration)）。
-
-    -c:v copy 模式下片段只能在关键帧切分，时长不可控，故必须在切片后按
-    实际 #EXTINF 的 ceil 最大值回写 TARGETDURATION。
-    """
-    if not playlist_path.exists():
-        return
-    content = playlist_path.read_text(encoding="utf-8")
-    durations = [float(m) for m in re.findall(r"#EXTINF:([\d.]+)", content)]
-    if not durations:
-        return
-    correct = max(1, math.ceil(max(durations)))
-    new_content, n = re.subn(
-        r"#EXT-X-TARGETDURATION:\d+",
-        f"#EXT-X-TARGETDURATION:{correct}",
-        content,
-        count=1,
-    )
-    if n and new_content != content:
-        playlist_path.write_text(new_content, encoding="utf-8")
+def _tool_available(path: str) -> bool:
+    return bool(shutil.which(path) or (Path(path).is_absolute() and Path(path).is_file()))
 
 
 def get_video_duration(filepath: str) -> int | None:
@@ -65,7 +40,7 @@ def probe_video_info(input_path: str) -> dict:
     """用 ffprobe 探测源视频编码、分辨率、码率和时长。"""
     probe_stream = subprocess.run(
         [settings.FFPROBE_BIN, "-v", "quiet", "-select_streams", "v:0",
-         "-show_entries", "stream=codec_name,width,height,bit_rate,avg_frame_rate,r_frame_rate",
+         "-show_entries", "stream=codec_name,profile,level,width,height,bit_rate,avg_frame_rate,r_frame_rate",
          "-of", "json", input_path],
         capture_output=True, text=True, timeout=60,
     )
@@ -84,6 +59,8 @@ def probe_video_info(input_path: str) -> dict:
         "average_bitrate": 2000000,
         "duration": 0.0,
         "frame_rate": 0.0,
+        "profile": "",
+        "level": 0,
     }
 
     def parse_rate(value: str) -> float:
@@ -104,6 +81,8 @@ def probe_video_info(input_path: str) -> dict:
         if streams:
             s = streams[0]
             info["codec"] = s.get("codec_name", "h264").lower()
+            info["profile"] = s.get("profile", "")
+            info["level"] = int(s.get("level") or 0)
             info["width"] = int(s.get("width", 1920))
             info["height"] = int(s.get("height", 1080))
             stream_br = s.get("bit_rate")
@@ -132,14 +111,15 @@ def probe_video_info(input_path: str) -> dict:
     return info
 
 
-def cmaf_demux_slice(input_path: str, output_dir: Path, print_fn=None) -> dict | None:
-    """CMAF demuxed 切片: 将源视频分离为独立的视频轨和音频轨 fMP4 片段。"""
+def apple_hls_slice(input_path: str, output_dir: Path, print_fn=None) -> dict | None:
+    """Apple HLS Tools 切片：生成音视频合一 stream.m3u8，并用 mediastreamvalidator 校验。"""
     if print_fn is None:
         print_fn = print
+    if not _tool_available(settings.MEDIAFILESEGMENTER_BIN):
+        print_fn("   Apple mediafilesegmenter 未安装，跳过 Apple HLS 切片")
+        return None
 
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    print_fn("   🔍 探测源视频信息...")
     probe_info = probe_video_info(input_path)
     src_codec = probe_info["codec"]
     width = probe_info["width"]
@@ -147,166 +127,187 @@ def cmaf_demux_slice(input_path: str, output_dir: Path, print_fn=None) -> dict |
     bitrate = probe_info["bitrate"]
     duration = probe_info["duration"]
 
-    print_fn(f"   编码: {src_codec} | 分辨率: {width}x{height} | 码率: {bitrate // 1000}kbps | 时长: {duration:.1f}s")
-
-    if src_codec in _INCOMPATIBLE_CODECS:
-        video_codec_args = ["-c:v", "libx264", "-crf", str(settings.CMAF_VIDEO_FALLBACK_CRF), "-preset", "medium"]
-        print_fn(f"   ⚠️ 源编码 {src_codec} 不兼容 fMP4, 转码为 H.264 (CRF {settings.CMAF_VIDEO_FALLBACK_CRF})")
-    else:
-        video_codec_args = ["-c:v", "copy"]
-
-    # 视频轨切片
-    print_fn("   🎬 切片视频轨...")
-    video_m3u8 = output_dir / "stream-v.m3u8"
-    video_seg_pattern = str(output_dir / "seg-v-%05d.m4s")
-
-    video_cmd = [
-        settings.FFMPEG_BIN, "-i", input_path,
-        "-map", "0:v:0", *video_codec_args, "-an",
-        "-f", "hls",
-        "-hls_time", str(settings.HLS_SEGMENT_SECONDS),
-        "-hls_list_size", "0",
-        "-hls_segment_type", "fmp4",
-        "-hls_fmp4_init_filename", "init-v.mp4",
-        "-hls_segment_filename", video_seg_pattern,
-        "-hls_flags", "independent_segments",
-        str(video_m3u8), "-y",
+    video_args = ["-c:v", "copy"] if src_codec in _COPYABLE_VIDEO_CODECS else [
+        "-c:v", "libx264", "-crf", str(settings.CMAF_VIDEO_FALLBACK_CRF), "-preset", "medium", "-pix_fmt", "yuv420p",
     ]
-    result = subprocess.run(video_cmd, capture_output=True, text=True, timeout=3600)
-    if result.returncode != 0:
-        print_fn(f"FFmpeg 视频轨错误:\n{result.stderr[-500:]}")
-        return None
+    if video_args[1] == "copy":
+        print_fn(f"   Apple HLS 准备: 视频 {src_codec} 直接封装，音频转 AAC")
+    else:
+        print_fn(f"   Apple HLS 准备: 视频 {src_codec} 转 H.264，音频转 AAC")
 
-    # 修正 TARGETDURATION（copy 模式片段时长不可控，FFmpeg 可能写出违反 HLS 规范的值）
-    _fix_target_duration(video_m3u8)
-
-    # 音频轨切片 (支持多音轨)
-    audio_probe = subprocess.run(
-        [settings.FFPROBE_BIN, "-v", "quiet", "-select_streams", "a",
-         "-show_entries", "stream=index,codec_name,channels,tags",
-         "-of", "json", input_path],
-        capture_output=True, text=True, timeout=60,
-    )
-    audio_streams: list[dict] = []
-    try:
-        probe_data = json.loads(audio_probe.stdout)
-        for i, s in enumerate(probe_data.get("streams", [])):
-            lang = (s.get("tags") or {}).get("language", "und")
-            title = (s.get("tags") or {}).get("title", "")
-            audio_streams.append({"index": i, "lang": lang, "title": title, "channels": s.get("channels", 2)})
-    except (json.JSONDecodeError, ValueError):
-        audio_streams = [{"index": 0, "lang": "und", "title": "", "channels": 2}]
-
-    if not audio_streams:
-        audio_streams = [{"index": 0, "lang": "und", "title": "", "channels": 2}]
-
-    print_fn(f"   🎵 切片音频轨 ({len(audio_streams)} 条)...")
-    audio_tracks_info: list[dict] = []
-
-    for ai, astream in enumerate(audio_streams):
-        suffix = f"a{ai}" if len(audio_streams) > 1 else "a"
-        audio_m3u8 = output_dir / f"stream-{suffix}.m3u8"
-        audio_seg_pattern = str(output_dir / f"seg-{suffix}-%05d.m4s")
-        init_filename = f"init-{suffix}.mp4"
-
-        audio_cmd = [
+    with tempfile.TemporaryDirectory(prefix="gy-apple-hls-") as tmp:
+        mezzanine = Path(tmp) / "source.mp4"
+        remux_cmd = [
             settings.FFMPEG_BIN, "-i", input_path,
-            "-map", f"0:a:{astream['index']}",
-            "-c:a", "aac", "-b:a", settings.CMAF_AUDIO_BITRATE, "-ac", str(settings.CMAF_AUDIO_CHANNELS),
-            "-vn",
-            "-f", "hls",
-            "-hls_time", str(settings.HLS_SEGMENT_SECONDS),
-            "-hls_list_size", "0",
-            "-hls_segment_type", "fmp4",
-            "-hls_fmp4_init_filename", init_filename,
-            "-hls_segment_filename", audio_seg_pattern,
-            "-hls_flags", "independent_segments",
-            str(audio_m3u8), "-y",
+            "-map", "0:v:0", "-map", "0:a:0",
+            *video_args,
+            "-c:a", "aac", "-b:a", settings.CMAF_AUDIO_BITRATE,
+            "-ac", str(settings.CMAF_AUDIO_CHANNELS),
+            "-movflags", "+faststart",
+            str(mezzanine), "-y",
         ]
-        result = subprocess.run(audio_cmd, capture_output=True, text=True, timeout=3600)
-        if result.returncode != 0:
-            if ai == 0:
-                print_fn(f"FFmpeg 音频轨 {ai} 错误:\n{result.stderr[-300:]}")
-                return None
-            else:
-                print_fn(f"   ⚠️ 音频轨 {ai} ({astream['lang']}) 切片失败，跳过")
-                continue
+        result = subprocess.run(remux_cmd, capture_output=True, text=True, timeout=7200)
+        if result.returncode != 0 or not mezzanine.exists():
+            print_fn(f"   Apple HLS 输入准备失败:\n{result.stderr[-500:]}")
+            return None
 
-        # 修正 TARGETDURATION，与视频轨保持一致的规范处理
-        _fix_target_duration(audio_m3u8)
+        segment_cmds = [
+            [
+                settings.MEDIAFILESEGMENTER_BIN,
+                "--file-base", str(output_dir),
+                "--target-duration", str(settings.HLS_SEGMENT_SECONDS),
+                "--base-media-file-name", "seg-",
+                "--index-file", "stream.m3u8",
+                "--iframe-index-file", "none",
+                str(mezzanine),
+            ],
+            [
+                settings.MEDIAFILESEGMENTER_BIN,
+                "--file-base", str(output_dir),
+                "--target-duration", str(settings.HLS_SEGMENT_SECONDS),
+                "--iframe-index-file", "none",
+                str(mezzanine),
+            ],
+        ]
+        segment_result = None
+        for cmd in segment_cmds:
+            segment_result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+            if segment_result.returncode == 0:
+                break
+        if not segment_result or segment_result.returncode != 0:
+            stderr = segment_result.stderr[-500:] if segment_result else ""
+            print_fn(f"   Apple mediafilesegmenter 失败:\n{stderr}")
+            return None
 
-        segs = sorted([f.name for f in output_dir.glob(f"seg-{suffix}-*.m4s")])
-        audio_tracks_info.append({
-            "index": ai, "suffix": suffix, "lang": astream["lang"],
-            "title": astream["title"], "channels": astream["channels"],
-            "init": init_filename, "m3u8": f"stream-{suffix}.m3u8", "segments": segs,
-        })
-        if len(audio_streams) > 1:
-            print_fn(f"      音轨 {ai}: {astream['lang']} ({astream['title'] or 'default'}) → {len(segs)} 片段")
-
-    if not audio_tracks_info:
-        print_fn("❌ 无音频轨生成")
+    _normalize_apple_media_playlist(output_dir)
+    stream_playlist = output_dir / "stream.m3u8"
+    if not stream_playlist.exists():
+        candidates = sorted(output_dir.glob("*.m3u8"))
+        if candidates:
+            candidates[0].rename(stream_playlist)
+    if not stream_playlist.exists():
+        print_fn("   Apple mediafilesegmenter 未生成 stream.m3u8")
         return None
 
-    video_segments = sorted([f.name for f in output_dir.glob("seg-v-*.m4s")])
-    if not (output_dir / "init-v.mp4").exists():
-        print_fn("❌ init-v.mp4 未生成")
-        return None
-    if not video_segments:
-        print_fn("❌ 无视频片段生成")
-        return None
-
-    primary_audio = audio_tracks_info[0]
-    audio_segments = primary_audio["segments"]
-
-    # 确定实际编码字符串
-    video_codec_str = "avc1.64001f"
-    init_v_path = output_dir / "init-v.mp4"
-    if init_v_path.exists():
-        try:
-            codec_probe = subprocess.run(
-                [settings.FFPROBE_BIN, "-v", "quiet", "-select_streams", "v:0",
-                 "-show_entries", "stream=codec_tag_string,profile,level",
-                 "-of", "json", str(init_v_path)],
-                capture_output=True, text=True, timeout=30,
-            )
-            codec_data = json.loads(codec_probe.stdout)
-            streams = codec_data.get("streams", [])
-            if streams:
-                tag = streams[0].get("codec_tag_string", "")
-                if tag and tag != "N/A":
-                    if tag.startswith("avc"):
-                        video_codec_str = "avc1.64001f"
-                    elif tag.startswith("hev") or tag.startswith("hvc"):
-                        video_codec_str = "hev1.1.6.L120"
-                    else:
-                        video_codec_str = tag
-        except (json.JSONDecodeError, ValueError, KeyError, subprocess.TimeoutExpired):
-            pass
-
+    video_codec_str = _codec_string_for_master(src_codec, probe_info)
     audio_codec_str = "mp4a.40.2"
+    segments = [
+        f.name for f in sorted(output_dir.iterdir())
+        if f.is_file() and f.name != "stream.m3u8" and f.suffix.lower() in {".ts", ".m4s"}
+    ]
+    if not segments:
+        print_fn("   Apple HLS 未生成媒体分片")
+        return None
+    hls_bitrates = _measure_hls_bitrates(stream_playlist)
+    bandwidth = hls_bitrates["peak"] or bitrate
+    average_bandwidth = hls_bitrates["average"] or probe_info.get("average_bitrate") or bitrate
 
-    print_fn(f"   ✅ 视频: {len(video_segments)} 片段 | 音频: {len(audio_segments)} 片段")
-    print_fn(f"   编码: video={video_codec_str}, audio={audio_codec_str}")
-
+    print_fn(f"   ✅ Apple HLS: {len(segments)} 片段 | {width}x{height}")
     return {
-        "videoSegments": video_segments,
-        "audioSegments": audio_segments,
-        "audioTracks": audio_tracks_info,
-        "videoInit": "init-v.mp4",
-        "audioInit": primary_audio["init"],
-        "hlsVideo": "stream-v.m3u8",
-        "hlsAudio": primary_audio["m3u8"],
+        "videoSegments": segments,
+        "audioSegments": segments,
+        "audioTracks": [],
+        "hlsVideo": "stream.m3u8",
+        "hlsAudio": "",
         "duration": duration,
         "videoCodec": video_codec_str,
         "audioCodec": audio_codec_str,
         "width": width,
         "height": height,
-        "bandwidth": bitrate,
-        "averageBandwidth": probe_info.get("average_bitrate") or bitrate,
+        "bandwidth": bandwidth,
+        "averageBandwidth": average_bandwidth,
         "frameRate": probe_info.get("frame_rate") or 0.0,
+        "appleHLS": True,
     }
 
+
+def _normalize_apple_media_playlist(output_dir: Path) -> None:
+    """Apple 工具不同版本输出文件名略有差异，统一入口为 stream.m3u8。"""
+    playlists = sorted(output_dir.glob("*.m3u8"))
+    preferred = output_dir / "stream.m3u8"
+    if preferred.exists():
+        _remove_independent_segments_tag(preferred)
+        return
+    for playlist in playlists:
+        if playlist.name.lower() in {"prog_index.m3u8", "index.m3u8"}:
+            playlist.rename(preferred)
+            _remove_independent_segments_tag(preferred)
+            return
+
+
+def _remove_independent_segments_tag(playlist_path: Path) -> None:
+    """Apple HLS master 统一声明 independent segments，media playlist 去重。"""
+    try:
+        lines = playlist_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return
+    filtered = [line for line in lines if line.strip() != "#EXT-X-INDEPENDENT-SEGMENTS"]
+    if filtered != lines:
+        playlist_path.write_text("\n".join(filtered) + "\n", encoding="utf-8")
+
+
+def _h264_profile_hex(profile: str) -> str:
+    normalized = (profile or "").lower()
+    if "baseline" in normalized:
+        return "42"
+    if "main" in normalized:
+        return "4d"
+    if "high" in normalized:
+        return "64"
+    return "64"
+
+
+def _codec_string_for_master(codec: str, probe_info: dict | None = None) -> str:
+    normalized = (codec or "").lower()
+    probe_info = probe_info or {}
+    if normalized in {"hevc", "h265"}:
+        return "hvc1.1.6.L120"
+    profile_hex = _h264_profile_hex(str(probe_info.get("profile") or ""))
+    try:
+        level = int(probe_info.get("level") or 31)
+    except (TypeError, ValueError):
+        level = 31
+    level = max(10, min(level, 255))
+    return f"avc1.{profile_hex}00{level:02x}"
+
+
+def _measure_hls_bitrates(playlist_path: Path) -> dict[str, int]:
+    """按 HLS playlist 的分片时长和文件大小估算峰值/平均码率。"""
+    if not playlist_path.exists():
+        return {"peak": 0, "average": 0}
+    try:
+        lines = playlist_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return {"peak": 0, "average": 0}
+
+    peak = 0.0
+    total_bits = 0
+    total_duration = 0.0
+    pending_duration = 0.0
+    for raw_line in lines:
+        line = raw_line.strip()
+        if line.startswith("#EXTINF:"):
+            try:
+                pending_duration = float(line.split(":", 1)[1].split(",", 1)[0])
+            except (IndexError, ValueError):
+                pending_duration = 0.0
+            continue
+        if not pending_duration or not line or line.startswith("#"):
+            continue
+
+        segment_path = playlist_path.parent / line
+        if not segment_path.exists():
+            pending_duration = 0.0
+            continue
+        bits = segment_path.stat().st_size * 8
+        bitrate = bits / pending_duration
+        peak = max(peak, bitrate)
+        total_bits += bits
+        total_duration += pending_duration
+        pending_duration = 0.0
+
+    average = total_bits / total_duration if total_duration > 0 else 0
+    return {"peak": math.ceil(peak), "average": math.ceil(average)}
 
 
 # ─── 字幕 fMP4 IMSC1 打包（Shaka Packager / stpp） ───

@@ -83,6 +83,10 @@ class _Settings:
     FFMPEG_BIN: str = "ffmpeg"
     FFPROBE_BIN: str = "ffprobe"
     PACKAGER_BIN: str = "packager"  # Shaka Packager（字幕 fMP4 IMSC1/stpp）
+    MEDIAFILESEGMENTER_BIN: str = "mediafilesegmenter"
+    MEDIASUBTITLESEGMENTER_BIN: str = "mediasubtitlesegmenter"
+    VARIANTPLAYLISTCREATOR_BIN: str = "variantplaylistcreator"
+    MEDIASTREAMVALIDATOR_BIN: str = "mediastreamvalidator"
 
     # 通知（沿用独立工具的 Telegram，可选；插件内另有 MoviePilot 通知）
     TG_BOT_TOKEN: str = ""

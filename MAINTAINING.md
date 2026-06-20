@@ -6,7 +6,7 @@
 integrations/moviepilot-plugin/plugins.v2/clouduploader/
 ```
 
-这是 MoviePilot V2 内嵌版云端上传插件。它在 MoviePilot 进程内完成整理事件监听、CMAF 切片、R2 上传、TMDB 元数据和站点入库。
+这是 MoviePilot V2 内嵌版云端上传插件。它在 MoviePilot 进程内完成整理事件监听、Apple HLS 切片、R2 上传、TMDB 元数据和站点入库。
 
 ## 和旧独立上传工具的关系
 
