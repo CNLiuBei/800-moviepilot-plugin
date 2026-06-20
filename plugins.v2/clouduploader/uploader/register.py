@@ -11,6 +11,154 @@ from .r2 import get_s3_client
 
 _HTTPX_REQUEST_KWARGS = {"trust_env": False}
 _TMDB_NFO_TIMEOUT = 5
+_DIRECTOR_JOBS = frozenset({"Director", "Co-Director"})
+_WRITER_JOBS = frozenset({"Writer", "Screenplay", "Teleplay", "Story"})
+
+
+def _esc(value) -> str:
+    return (value or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _crew_names(crew, jobs: frozenset[str], limit: int | None = None) -> list[str]:
+    seen: set[str] = set()
+    names: list[str] = []
+    for member in crew or []:
+        name = (member.get("name") or "").strip()
+        if not name or member.get("job") not in jobs or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+        if limit and len(names) >= limit:
+            break
+    return names
+
+
+def _studio_names(d: dict, media_type: str) -> list[str]:
+    if media_type == "tv":
+        return [name for name in (n.get("name") for n in d.get("networks", [])) if name]
+    return [
+        name
+        for name in (c.get("name") for c in d.get("production_companies", [])[:5])
+        if name
+    ]
+
+
+def _episode_crew(ep: dict) -> list[dict]:
+    credits = ep.get("credits") if isinstance(ep.get("credits"), dict) else {}
+    return list(ep.get("crew") or credits.get("crew") or [])
+
+
+def _episode_guest_stars(ep: dict) -> list[dict]:
+    credits = ep.get("credits") if isinstance(ep.get("credits"), dict) else {}
+    return list(ep.get("guest_stars") or credits.get("guest_stars") or [])
+
+
+def _append_show_metadata_lines(lines: list[str], d: dict, media_type: str) -> None:
+    tagline = (d.get("tagline") or "").strip()
+    if tagline:
+        lines.append(f"  <tagline>{_esc(tagline)}</tagline>")
+        lines.append(f"  <outline>{_esc(tagline)}</outline>")
+
+    crew = (d.get("credits") or {}).get("crew") or []
+    for name in _crew_names(crew, _DIRECTOR_JOBS, limit=5):
+        lines.append(f"  <director>{_esc(name)}</director>")
+    for name in _crew_names(crew, _WRITER_JOBS, limit=8):
+        lines.append(f"  <credits>{_esc(name)}</credits>")
+
+    for studio in _studio_names(d, media_type):
+        lines.append(f"  <studio>{_esc(studio)}</studio>")
+
+
+def _format_tmdb_rating(vote_average, vote_count=None) -> str:
+    try:
+        text = f"{float(vote_average):.3f}".rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        text = "0"
+    attrs = 'name="themoviedb" max="10" default="true"'
+    if vote_count is not None:
+        attrs += f' votes="{int(vote_count)}"'
+    return f"  <rating {attrs}>{text}</rating>"
+
+
+def _premiered_date(d: dict, media_type: str) -> str:
+    if media_type == "tv":
+        return (d.get("first_air_date") or "").strip()
+    return (d.get("release_date") or "").strip()
+
+
+def _append_show_identity_lines(lines: list[str], d: dict, media_type: str, tmdb_id: int) -> None:
+    premiered = _premiered_date(d, media_type)
+    if premiered:
+        lines.append(f"  <premiered>{premiered}</premiered>")
+
+    if media_type == "tv":
+        status = (d.get("status") or "").strip()
+        if status:
+            lines.append(f"  <status>{_esc(status)}</status>")
+        last_air = (d.get("last_air_date") or "").strip()
+        if last_air and last_air != premiered:
+            lines.append(f"  <enddate>{last_air}</enddate>")
+
+    for code in d.get("origin_country") or []:
+        if code:
+            lines.append(f"  <country>{_esc(code)}</country>")
+
+    lines.append(_format_tmdb_rating(d.get("vote_average", 0), d.get("vote_count")))
+    lines.append(f"  <uniqueid type=\"tmdb\" default=\"true\">{tmdb_id}</uniqueid>")
+    imdb = (d.get("external_ids") or {}).get("imdb_id", "")
+    if imdb:
+        lines.append(f'  <uniqueid type="imdb" default="false">{imdb}</uniqueid>')
+
+
+_TMDB_MIRROR_SIZES = frozenset({
+    "w45", "w92", "w154", "w185", "w300", "w342", "w500", "w780", "w1280", "h632", "original",
+})
+
+
+def _tmdb_file_name(path: str) -> str | None:
+    raw = (path or "").strip()
+    if not raw:
+        return None
+    name = raw.rsplit("/", 1)[-1]
+    if not name or name.startswith("."):
+        return None
+    return name
+
+
+def _tmdb_mirror_key(path: str, size: str) -> str | None:
+    """R2 key aligned with TMDB CDN layout: tmdb/t/p/{size}/{file}."""
+    file_name = _tmdb_file_name(path)
+    if not file_name:
+        return None
+    mirror_size = size if size in _TMDB_MIRROR_SIZES else "original"
+    return f"tmdb/t/p/{mirror_size}/{file_name}"
+
+
+def _content_type_for_tmdb_path(path: str) -> str:
+    lower = (path or "").lower()
+    if lower.endswith(".png"):
+        return "image/png"
+    if lower.endswith(".webp"):
+        return "image/webp"
+    if lower.endswith(".svg"):
+        return "image/svg+xml"
+    return "image/jpeg"
+
+
+def _pick_logo_path(images: dict | None) -> str | None:
+    """Pick TMDB logo path (zh → en → first), aligned with 800 workers pickLogo."""
+    logos = (images or {}).get("logos") or []
+    if not logos:
+        return None
+    zh = next((item for item in logos if item.get("iso_639_1") == "zh"), None)
+    en = next((item for item in logos if item.get("iso_639_1") == "en"), None)
+    chosen = zh or en or logos[0]
+    path = (chosen or {}).get("file_path") or ""
+    if not path:
+        return None
+    if path.lower().endswith(".svg"):
+        return None
+    return path
 
 
 def _upload_tmdb_image(path: str, size: str, r2_key: str, print_fn, label: str) -> None:
@@ -30,7 +178,7 @@ def _upload_tmdb_image(path: str, size: str, r2_key: str, print_fn, label: str) 
             Bucket=settings.R2_BUCKET,
             Key=r2_key,
             Body=img.content,
-            ContentType="image/jpeg",
+            ContentType=_content_type_for_tmdb_path(path),
         )
         print_fn(f"   ✅ {label} ({len(img.content) // 1024} KB)")
     except Exception as e:
@@ -299,9 +447,6 @@ def write_episode_nfo(
     if print_fn is None:
         print_fn = print
 
-    def esc(s):
-        return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
     def put_minimal_episode_nfo(reason: str):
         try:
             lines = [
@@ -311,7 +456,7 @@ def write_episode_nfo(
                 f"  <season>{season}</season>",
                 f"  <episode>{episode}</episode>",
                 f"  <uniqueid type=\"tmdb\">{tmdb_id}</uniqueid>",
-                f"  <fileinfo><streamdetails><video><codec>copy</codec><aspect>{esc(resolution or 'original')}</aspect></video></streamdetails></fileinfo>",
+                f"  <fileinfo><streamdetails><video><codec>copy</codec><aspect>{_esc(resolution or 'original')}</aspect></video></streamdetails></fileinfo>",
                 "</episodedetails>",
             ]
             get_s3_client().put_object(
@@ -327,7 +472,11 @@ def write_episode_nfo(
         try:
             ep = httpx.get(
                 f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/{season}/episode/{episode}",
-                params={"language": "zh-CN", **_auth["params"]},
+                params={
+                    "language": "zh-CN",
+                    "append_to_response": "credits",
+                    **_auth["params"],
+                },
                 headers=_auth["headers"],
                 timeout=_TMDB_NFO_TIMEOUT,
                 **_HTTPX_REQUEST_KWARGS,
@@ -336,19 +485,37 @@ def write_episode_nfo(
             put_minimal_episode_nfo(_request_error("TMDB episode 请求失败", e))
             return
 
+        crew = _episode_crew(ep)
+        guest_stars = _episode_guest_stars(ep)
+
         lines = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>', "<episodedetails>"]
-        lines.append(f"  <title>{esc(ep.get('name', ''))}</title>")
+        lines.append(f"  <title>{_esc(ep.get('name', ''))}</title>")
         lines.append(f"  <season>{season}</season>")
         lines.append(f"  <episode>{episode}</episode>")
-        lines.append(f"  <plot>{esc(ep.get('overview', ''))}</plot>")
-        lines.append(f"  <aired>{ep.get('air_date', '')}</aired>")
-        lines.append(f"  <rating>{ep.get('vote_average', 0)}</rating>")
-        lines.append(f"  <runtime>{ep.get('runtime', 0)}</runtime>")
-        lines.append(f"  <uniqueid type=\"tmdb\">{ep.get('id', '')}</uniqueid>")
-        for d in [c for c in ep.get('crew', []) if c.get('job') == 'Director'][:3]:
-            lines.append(f"  <director>{esc(d['name'])}</director>")
-        for g in ep.get('guest_stars', [])[:10]:
-            lines.append(f"  <actor><name>{esc(g['name'])}</name><role>{esc(g.get('character', ''))}</role></actor>")
+        lines.append(f"  <plot>{_esc(ep.get('overview', ''))}</plot>")
+        air_date = (ep.get("air_date") or "").strip()
+        if air_date:
+            lines.append(f"  <aired>{air_date}</aired>")
+            lines.append(f"  <premiered>{air_date}</premiered>")
+        lines.append(_format_tmdb_rating(ep.get("vote_average", 0), ep.get("vote_count")))
+        runtime = ep.get("runtime")
+        if runtime:
+            lines.append(f"  <runtime>{int(runtime)}</runtime>")
+        episode_tmdb_id = ep.get("id", "")
+        if episode_tmdb_id:
+            lines.append(f"  <uniqueid type=\"tmdb\" default=\"true\">{episode_tmdb_id}</uniqueid>")
+        for name in _crew_names(crew, _DIRECTOR_JOBS, limit=3):
+            lines.append(f"  <director>{_esc(name)}</director>")
+        for name in _crew_names(crew, _WRITER_JOBS, limit=5):
+            lines.append(f"  <credits>{_esc(name)}</credits>")
+        for g in guest_stars[:10]:
+            lines.append(
+                f"  <actor><name>{_esc(g['name'])}</name>"
+                f"<role>{_esc(g.get('character', ''))}</role></actor>"
+            )
+        still_path = ep.get("still_path") or ""
+        if still_path:
+            lines.append(f"  <thumb>https://image.tmdb.org/t/p/w500{still_path}</thumb>")
         lines.append("  <fileinfo><streamdetails>")
         lines.append(f"    <video><codec>copy</codec><aspect>{resolution or 'original'}</aspect></video>")
         lines.append("    <audio><codec>aac</codec><channels>2</channels></audio>")
@@ -362,20 +529,15 @@ def write_episode_nfo(
         )
         print_fn(f"   ✅ episode.nfo: {ep.get('name', '')}")
 
-        if ep.get('still_path'):
-            img = httpx.get(
-                f"https://image.tmdb.org/t/p/w500{ep['still_path']}",
-                timeout=_TMDB_NFO_TIMEOUT, follow_redirects=True,
-                **_HTTPX_REQUEST_KWARGS,
-            )
-            if img.status_code == 200:
-                s3.put_object(
-                    Bucket=settings.R2_BUCKET, Key=f"{r2_path}/thumb.jpg",
-                    Body=img.content, ContentType="image/jpeg",
+        if still_path:
+            mirror_key = _tmdb_mirror_key(still_path, "w500")
+            if mirror_key:
+                _upload_tmdb_image(
+                    still_path, "w500", mirror_key, print_fn,
+                    label=mirror_key,
                 )
-                print_fn(f"   ✅ thumb.jpg (TMDB 剧照, {len(img.content) // 1024} KB)")
         else:
-            print_fn("   无 TMDB 剧照, 前端将显示海报")
+            print_fn("   无 TMDB 剧照")
 
     except Exception as e:
         print_fn(f"   ⚠️ episode.nfo: {e}")
@@ -385,9 +547,6 @@ def write_show_nfo(tmdb_id: int, media_type: str, print_fn=None):
     """写 tvshow.nfo / movie.nfo。"""
     if print_fn is None:
         print_fn = print
-
-    def esc(s):
-        return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     def put_minimal_show_nfo(reason: str):
         try:
@@ -413,7 +572,12 @@ def write_show_nfo(tmdb_id: int, media_type: str, print_fn=None):
         try:
             d = httpx.get(
                 f"https://api.themoviedb.org/3/{media_type}/{tmdb_id}",
-                params={"language": "zh-CN", "append_to_response": "credits,external_ids", **_auth["params"]},
+                params={
+                    "language": "zh-CN",
+                    "append_to_response": "credits,external_ids,images",
+                    "include_image_language": "zh,en,null",
+                    **_auth["params"],
+                },
                 headers=_auth["headers"],
                 timeout=_TMDB_NFO_TIMEOUT,
                 **_HTTPX_REQUEST_KWARGS,
@@ -426,20 +590,24 @@ def write_show_nfo(tmdb_id: int, media_type: str, print_fn=None):
         title = d.get("name") or d.get("title") or ""
 
         lines = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>', f"<{root}>"]
-        lines.append(f"  <title>{esc(title)}</title>")
-        lines.append(f"  <originaltitle>{esc(d.get('original_name') or d.get('original_title', ''))}</originaltitle>")
-        lines.append(f"  <plot>{esc(d.get('overview', ''))}</plot>")
-        lines.append(f"  <year>{(d.get('first_air_date') or d.get('release_date', ''))[:4]}</year>")
-        lines.append(f"  <rating>{d.get('vote_average', 0)}</rating>")
-        lines.append(f"  <uniqueid type=\"tmdb\">{tmdb_id}</uniqueid>")
-        imdb = (d.get('external_ids') or {}).get('imdb_id', '')
-        if imdb:
-            lines.append(f'  <uniqueid type="imdb">{imdb}</uniqueid>')
+        lines.append(f"  <title>{_esc(title)}</title>")
+        lines.append(f"  <originaltitle>{_esc(d.get('original_name') or d.get('original_title', ''))}</originaltitle>")
+        lines.append(f"  <plot>{_esc(d.get('overview', ''))}</plot>")
+        _append_show_metadata_lines(lines, d, media_type)
+        year = (d.get("first_air_date") or d.get("release_date") or "")[:4]
+        if year:
+            lines.append(f"  <year>{year}</year>")
+        if media_type == "movie" and d.get("runtime"):
+            lines.append(f"  <runtime>{int(d['runtime'])}</runtime>")
+        _append_show_identity_lines(lines, d, media_type, tmdb_id)
         for g in d.get("genres", []):
-            lines.append(f"  <genre>{esc(g['name'])}</genre>")
+            lines.append(f"  <genre>{_esc(g['name'])}</genre>")
         cast = (d.get("credits", {}).get("cast", []))[:15]
         for a in cast:
-            lines.append(f"  <actor><name>{esc(a['name'])}</name><role>{esc(a.get('character', ''))}</role></actor>")
+            lines.append(
+                f"  <actor><name>{_esc(a['name'])}</name>"
+                f"<role>{_esc(a.get('character', ''))}</role></actor>"
+            )
         poster_path = d.get("poster_path") or ""
         backdrop_path = d.get("backdrop_path") or ""
         if poster_path:
@@ -456,13 +624,27 @@ def write_show_nfo(tmdb_id: int, media_type: str, print_fn=None):
             Body="\n".join(lines).encode("utf-8"), ContentType="application/xml",
         )
         print_fn(f"   ✅ {nfo_name}")
-        _upload_tmdb_image(
-            poster_path, "w500", f"{r2_base}/poster.jpg", print_fn,
-            label="poster.jpg",
-        )
-        _upload_tmdb_image(
-            backdrop_path, "w1280", f"{r2_base}/fanart.jpg", print_fn,
-            label="fanart.jpg",
-        )
+        if poster_path:
+            mirror_key = _tmdb_mirror_key(poster_path, "w500")
+            if mirror_key:
+                _upload_tmdb_image(
+                    poster_path, "w500", mirror_key, print_fn,
+                    label=mirror_key,
+                )
+        if backdrop_path:
+            mirror_key = _tmdb_mirror_key(backdrop_path, "w1280")
+            if mirror_key:
+                _upload_tmdb_image(
+                    backdrop_path, "w1280", mirror_key, print_fn,
+                    label=mirror_key,
+                )
+        logo_path = _pick_logo_path(d.get("images"))
+        if logo_path:
+            mirror_key = _tmdb_mirror_key(logo_path, "w500")
+            if mirror_key:
+                _upload_tmdb_image(
+                    logo_path, "w500", mirror_key, print_fn,
+                    label=mirror_key,
+                )
     except Exception as e:
         print_fn(f"   ⚠️ show nfo: {e}")

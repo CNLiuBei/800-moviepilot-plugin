@@ -2,7 +2,7 @@
 """
 Backfill show/movie metadata to R2 without re-uploading video.
 
-Writes tvshow.nfo / movie.nfo + poster.jpg + fanart.jpg via write_show_nfo().
+Writes tvshow.nfo / movie.nfo and caches TMDB images under tmdb/t/p/{size}/{file}.
 
 Usage (inside MoviePilot container or with matching env):
   python3 scripts/backfill_show_metadata.py 239385 259837
