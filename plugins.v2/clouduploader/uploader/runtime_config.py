@@ -52,6 +52,8 @@ class _Settings:
 
     # TMDB
     TMDB_TOKEN: str = ""
+    TMDB_PROXY_BASE: str = ""
+    TMDB_IMAGE_PROXY_BASE: str = ""
 
     @property
     def tmdb_auth(self) -> dict:
@@ -116,6 +118,8 @@ class _Settings:
                         continue
                 elif key_upper == "API_BASE":
                     value = normalize_base_url(value, "流媒体站地址")
+                elif key_upper in {"TMDB_PROXY_BASE", "TMDB_IMAGE_PROXY_BASE"}:
+                    value = str(value).strip().rstrip("/")
                 elif isinstance(cur, str):
                     value = str(value).strip()
                 setattr(self, key_upper, value)

@@ -8,9 +8,11 @@ import httpx
 
 from .runtime_config import ConfigError, normalize_base_url, settings
 from .r2 import get_s3_client
+from .tmdb_http import tmdb_download_image, tmdb_get_json
 
 _HTTPX_REQUEST_KWARGS = {"trust_env": False}
-_TMDB_NFO_TIMEOUT = 5
+_TMDB_NFO_TIMEOUT = 25
+_TMDB_NFO_DIRECT_TIMEOUT = 4
 _DIRECTOR_JOBS = frozenset({"Director", "Co-Director"})
 _WRITER_JOBS = frozenset({"Writer", "Screenplay", "Teleplay", "Story"})
 
@@ -165,22 +167,18 @@ def _upload_tmdb_image(path: str, size: str, r2_key: str, print_fn, label: str) 
     if not path:
         return
     try:
-        img = httpx.get(
-            f"https://image.tmdb.org/t/p/{size}{path}",
-            timeout=_TMDB_NFO_TIMEOUT,
-            follow_redirects=True,
-            **_HTTPX_REQUEST_KWARGS,
-        )
-        if img.status_code != 200:
-            print_fn(f"   ⚠️ {label} 下载失败: HTTP {img.status_code}")
+        downloaded = tmdb_download_image(path, size, timeout=_TMDB_NFO_TIMEOUT)
+        if not downloaded:
+            print_fn(f"   ⚠️ {label} 下载失败（直连与代理均失败）")
             return
+        body, content_type = downloaded
         get_s3_client().put_object(
             Bucket=settings.R2_BUCKET,
             Key=r2_key,
-            Body=img.content,
-            ContentType=_content_type_for_tmdb_path(path),
+            Body=body,
+            ContentType=content_type or _content_type_for_tmdb_path(path),
         )
-        print_fn(f"   ✅ {label} ({len(img.content) // 1024} KB)")
+        print_fn(f"   ✅ {label} ({len(body) // 1024} KB)")
     except Exception as e:
         print_fn(f"   ⚠️ {label}: {e}")
 
@@ -468,19 +466,14 @@ def write_episode_nfo(
             print_fn(f"   ⚠️ episode.nfo 最小元数据写入失败: {e}")
 
     try:
-        _auth = settings.tmdb_auth
         try:
-            ep = httpx.get(
-                f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/{season}/episode/{episode}",
-                params={
-                    "language": "zh-CN",
-                    "append_to_response": "credits",
-                    **_auth["params"],
-                },
-                headers=_auth["headers"],
+            ep = tmdb_get_json(
+                f"/tv/{tmdb_id}/season/{season}/episode/{episode}",
+                {"append_to_response": "credits"},
                 timeout=_TMDB_NFO_TIMEOUT,
-                **_HTTPX_REQUEST_KWARGS,
-            ).json()
+                direct_timeout=_TMDB_NFO_DIRECT_TIMEOUT,
+                proxy_timeout=_TMDB_NFO_TIMEOUT,
+            )
         except httpx.HTTPError as e:
             put_minimal_episode_nfo(_request_error("TMDB episode 请求失败", e))
             return
@@ -568,20 +561,17 @@ def write_show_nfo(tmdb_id: int, media_type: str, print_fn=None):
             print_fn(f"   ⚠️ show nfo 最小元数据写入失败: {e}")
 
     try:
-        _auth = settings.tmdb_auth
         try:
-            d = httpx.get(
-                f"https://api.themoviedb.org/3/{media_type}/{tmdb_id}",
-                params={
-                    "language": "zh-CN",
+            d = tmdb_get_json(
+                f"/{media_type}/{tmdb_id}",
+                {
                     "append_to_response": "credits,external_ids,images",
                     "include_image_language": "zh,en,null",
-                    **_auth["params"],
                 },
-                headers=_auth["headers"],
                 timeout=_TMDB_NFO_TIMEOUT,
-                **_HTTPX_REQUEST_KWARGS,
-            ).json()
+                direct_timeout=_TMDB_NFO_DIRECT_TIMEOUT,
+                proxy_timeout=_TMDB_NFO_TIMEOUT,
+            )
         except httpx.HTTPError as e:
             put_minimal_show_nfo(_request_error("TMDB show 请求失败", e))
             return

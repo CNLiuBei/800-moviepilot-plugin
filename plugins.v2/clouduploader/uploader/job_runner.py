@@ -23,6 +23,7 @@ from .runtime_config import settings
 from .parser import parse_filename
 from .slicer import apple_hls_slice, get_video_duration
 from .subtitles import extract_subtitles, generate_hls_subtitle_playlists
+from .tmdb import get_original_language, verify_tmdb_metadata
 from .register import auto_register, write_episode_nfo, write_show_nfo
 from .notify import notify_upload_success, notify_upload_failed
 from .r2 import get_s3_client, _MIME_MAP
@@ -403,18 +404,16 @@ def _cleanup_empty_parent_dirs(
 # ─── CMAF Manifest 生成 ───
 
 def _generate_manifests(output_dir: Path, cmaf_result: dict, log, subtitles_info: list[dict] | None = None):
-    """生成 master.m3u8 和 stream.mpd（多音轨支持）"""
+    """生成 master.m3u8 和 stream.mpd，并用 mediastreamvalidator 校验。"""
     from .manifest import generate_hls_master, generate_dash_mpd, validate_hls_media_playlists
 
-    generate_hls_master(cmaf_result, output_dir, print_fn=lambda x: None, subtitles_info=subtitles_info)
-    if cmaf_result.get("appleHLS"):
-        _validate_with_apple_tool(output_dir / "master.m3u8", log)
-        return
+    generate_hls_master(cmaf_result, output_dir, print_fn=log, subtitles_info=subtitles_info)
     try:
-        playlist_info = validate_hls_media_playlists(output_dir, print_fn=lambda x: None)
-        generate_dash_mpd(cmaf_result, playlist_info, output_dir, print_fn=lambda x: None)
+        playlist_info = validate_hls_media_playlists(output_dir, print_fn=log)
+        generate_dash_mpd(cmaf_result, playlist_info, output_dir, print_fn=log)
     except Exception as e:
-        log(f"[manifest] MPD 生成失败 ({output_dir.name}): {e}")
+        log(f"   ⚠️ DASH MPD 生成跳过: {e}")
+    _validate_with_apple_tool(output_dir / "master.m3u8", log)
 
 
 def _validate_with_apple_tool(master_playlist: Path, log) -> None:
@@ -445,8 +444,8 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
 
     Args:
         params: 任务参数 dict，至少包含 filepath, tmdb_id；可选 media_type/season/episode/
-                cmaf/clean_after/force_overwrite/skip_slice/skip_upload/skip_register/no_subtitles/
-                retry_attempts（每阶段重试次数，默认 3）
+                cmaf/clean_after/force_overwrite/skip_slice/skip_upload/skip_register/skip_metadata_check/
+                no_subtitles/retry_attempts（每阶段重试次数，默认 3）
         log_fn: 日志回调 log_fn(str)，默认 print
         cancel_check: 取消检查回调 () -> bool，默认永不取消
 
@@ -495,6 +494,21 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
         if params.get("force_overwrite"):
             log("⚠️ 强制覆盖模式: 将删除 R2 旧数据并重新上传")
 
+        if not params.get("skip_metadata_check"):
+            if cancel_check():
+                return {"status": "cancelled", "error": None, "r2_path": None}
+            log("🔍 查询 TMDB 元数据...")
+            ok_meta, resolved_type, meta_err = verify_tmdb_metadata(
+                int(tmdb_id), media_type, season, episode,
+            )
+            if not ok_meta:
+                log(f"❌ {meta_err}")
+                return {"status": "error", "error": meta_err, "r2_path": None, "stage": "metadata"}
+            if resolved_type != media_type:
+                log(f"   ℹ️ 媒体类型修正: {media_type} → {resolved_type}")
+                media_type = resolved_type
+            log(f"   ✅ TMDB 元数据可用 ({media_type}/{tmdb_id})")
+
         if has_episode:
             r2_path = f"tmdb/{media_type}/{tmdb_id}/season/{int(season)}/episode/{int(episode)}"
         else:
@@ -514,6 +528,14 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
         subtitles_info = None  # HLS WebVTT 字幕轨信息
         video_duration = None  # 视频时长（秒），切片后填充，用于更新分集时长
         upload_verified = False
+        original_language = params.get("original_language")
+        if not original_language and tmdb_id and not remote_uploaded:
+            original_language, tmdb_lang_error = get_original_language(int(tmdb_id), media_type)
+            if original_language:
+                log(f"   TMDB 原声语言: {original_language}")
+            elif tmdb_lang_error:
+                log(f"   ⚠️ 未能读取 TMDB 原声语言 ({tmdb_lang_error})")
+
         if remote_uploaded:
             marker_subtitles = remote_marker.get("subtitles")
             if isinstance(marker_subtitles, list):
@@ -528,7 +550,12 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
                 return {"status": "cancelled", "error": None, "r2_path": r2_path}
             log("📝 提取字幕...")
             local_output.mkdir(parents=True, exist_ok=True)
-            subtitles = extract_subtitles(filepath, local_output, print_fn=log)
+            subtitles = extract_subtitles(
+                filepath,
+                local_output,
+                print_fn=log,
+                original_language=original_language,
+            )
             if subtitles:
                 for sub in subtitles:
                     log(f"   字幕 [{sub['lang']}] {sub['label']}")
@@ -554,14 +581,14 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
                 # 检查本身失败不应阻断流程，仅记录
                 log(f"   ⚠️ 磁盘空间检查跳过: {e}")
 
-            log("🎬 Apple HLS 切片 (官方工具)...")
+            log("🎬 CMAF fMP4 切片（音画分离，stream copy）...")
             start = time.time()
 
             def _do_apple_hls():
-                result = apple_hls_slice(filepath, local_output, print_fn=log)
-                if result:
-                    log("   使用 Apple HLS Tools 生成原生播放清单")
-                return result
+                return apple_hls_slice(
+                    filepath, local_output, print_fn=log,
+                    original_language=original_language,
+                )
 
             # 切片失败重试（少量次数，切片多为确定性失败，重试主要应对偶发 I/O）
             ok_slice, cmaf_result = retry(
@@ -576,7 +603,7 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
             v_segs = len(cmaf_result["videoSegments"])
             video_duration = cmaf_result.get("duration") or None
             sz = sum(f.stat().st_size for f in local_output.rglob("*") if f.is_file()) / (1024**3)
-            log(f"   ✅ Apple HLS {v_segs} 片段, {sz:.2f} GB, {time.time()-start:.1f}s")
+            log(f"   ✅ CMAF {v_segs} 视频片段, {sz:.2f} GB, {time.time()-start:.1f}s")
             log(f"   编码: {cmaf_result['videoCodec']} + {cmaf_result['audioCodec']}")
             if subtitles and not subtitles_info:
                 subtitles_info = generate_hls_subtitle_playlists(subtitles, local_output, print_fn=log)

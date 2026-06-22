@@ -43,7 +43,7 @@ class CloudUploader(_PluginBase):
     plugin_name = "云端自动上传"
     plugin_desc = "整理完成后自动 Apple HLS 切片→上传R2→入库到流媒体站，全流程在插件内完成。"
     plugin_icon = "upload.png"
-    plugin_version = "2.4.17"
+    plugin_version = "2.5.7"
     plugin_author = "cn"
     author_url = "https://github.com/CNLiuBei/800-moviepilot-plugin"
     plugin_config_prefix = "clouduploader_"
@@ -153,6 +153,8 @@ class CloudUploader(_PluginBase):
             api_username=config.get("api_username", ""),
             api_password=config.get("api_password", ""),
             tmdb_token=tmdb_token,
+            tmdb_proxy_base=(config.get("tmdb_proxy_base") or "").strip(),
+            tmdb_image_proxy_base=(config.get("tmdb_image_proxy_base") or "").strip(),
             hls_output_dir=hls_dir,
             hls_segment_seconds=config.get("segment_seconds") or 6,
             upload_concurrency=config.get("concurrency") or 8,
@@ -373,6 +375,8 @@ class CloudUploader(_PluginBase):
                         prog["stage"] = "完成"
                     elif "字幕" in msg:
                         prog["stage"] = "提取字幕"
+                    elif "元数据" in msg or "🔍" in msg:
+                        prog["stage"] = "元数据查询"
 
             try:
                 result = run_job(params, log_fn=_progress_log)
@@ -1071,6 +1075,8 @@ class CloudUploader(_PluginBase):
                          _text("api_password", "站点密码", md=6, ptype="password")),
                     # TMDB
                     _row(_text("tmdb_token", "TMDB Token/API Key（留空则用 MoviePilot 自带）", md=12, ptype="password")),
+                    _row(_text("tmdb_proxy_base", "TMDB 元数据代理（留空默认 tmdb.liubei.org）", md=6),
+                         _text("tmdb_image_proxy_base", "TMDB 图片代理 /api/t/p 基址（留空走站点）", md=6)),
                     # 二进制路径
                     _row(_text("ffmpeg_bin", "ffmpeg 路径", "ffmpeg", md=6),
                          _text("ffprobe_bin", "ffprobe 路径", "ffprobe", md=6)),
@@ -1088,8 +1094,8 @@ class CloudUploader(_PluginBase):
                                 "text": ("整理完成后，插件等待指定延迟确认文件存在，"
                                          "再在后台队列内依次完成 Apple HLS 切片→R2上传→站点入库。\n"
                                          "R2 配置：填一个 Cloudflare R2 API Token 即可自动获取账户ID/密钥/桶，无需手填。\n"
-                                         "TMDB：留空自动用 MoviePilot 自带。\n"
-                                         "切片器：使用 Apple HLS Tools；缺失或校验失败时任务直接失败。\n"
+                                         "TMDB：留空自动用 MoviePilot 自带；直连失败时走 tmdb.liubei.org 中继（代连 TMDB 官方，不读站点库）。\n"
+                                         "切片器：视频/音轨 Apple 支持编码均 copy；保留全部音轨（TMDB 原声默认）；Apple HLS Tools 校验。\n"
                                          "因此通常只需填：CF API Token + 流媒体站地址 + 站点认证。"),
                             },
                         }],
@@ -1106,6 +1112,7 @@ class CloudUploader(_PluginBase):
             "r2_access_key_id": "", "r2_secret_access_key": "",
             "api_base": "", "api_admin_key": "",
             "api_username": "", "api_password": "", "tmdb_token": "",
+            "tmdb_proxy_base": "", "tmdb_image_proxy_base": "",
             "ffmpeg_bin": "ffmpeg", "ffprobe_bin": "ffprobe",
             "mediafilesegmenter_bin": "mediafilesegmenter",
             "mediasubtitlesegmenter_bin": "mediasubtitlesegmenter",

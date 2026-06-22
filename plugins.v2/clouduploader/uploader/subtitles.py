@@ -85,10 +85,39 @@ _ZH_HANT_LABEL_HINTS = (
     "繁體", "繁体", "繁中", "繁體中文", "繁体中文", "繁體字幕", "繁体字幕",
     "繁日", "繁英", "cht", "tc", "zh-hant", "zh_tw", "zh-tw", "traditional",
 )
-_ORIGINAL_LABEL_HINTS = (
+_GENERIC_ORIGINAL_LABEL_HINTS = (
     "原声", "原聲", "原文", "原版", "original",
-    "日文", "日语", "日語", "日本語", "japanese", "jpn",
-    "韩文", "韓文", "韩语", "韓語", "한국어", "korean", "kor",
+)
+_ORIGINAL_LABEL_HINTS_BY_LANG: dict[str, tuple[str, ...]] = {
+    "ja": ("日文", "日语", "日語", "日本語", "japanese", "jpn", "jp"),
+    "ko": ("韩文", "韓文", "韩语", "韓語", "한국어", "korean", "kor", "kr"),
+    "en": ("英文", "英语", "english", "eng"),
+    "fr": ("法文", "法语", "french", "fra", "fre"),
+    "de": ("德文", "德语", "german", "deu", "ger"),
+    "es": ("西班牙", "spanish", "spa"),
+    "it": ("意大利", "italian", "ita"),
+    "pt": ("葡萄牙", "portuguese", "por"),
+    "ru": ("俄文", "俄语", "russian", "rus"),
+    "th": ("泰文", "泰语", "thai", "tha"),
+    "vi": ("越南", "vietnamese", "vie"),
+    "ar": ("阿拉伯", "arabic", "ara"),
+}
+_TRACK_LANG_ALIASES: dict[str, set[str]] = {
+    "ja": {"ja", "jpn", "jp", "japanese"},
+    "ko": {"ko", "kor", "kr", "korean"},
+    "en": {"en", "eng", "english"},
+    "fr": {"fr", "fre", "fra", "french"},
+    "de": {"de", "deu", "ger", "german"},
+    "es": {"es", "spa", "spanish"},
+    "it": {"it", "ita", "italian"},
+    "pt": {"pt", "por", "portuguese"},
+    "ru": {"ru", "rus", "russian"},
+    "th": {"th", "tha", "thai"},
+    "vi": {"vi", "vie", "vietnamese"},
+    "ar": {"ar", "ara", "arabic"},
+}
+_ORIGINAL_LABEL_HINTS = _GENERIC_ORIGINAL_LABEL_HINTS + tuple(
+    hint for hints in _ORIGINAL_LABEL_HINTS_BY_LANG.values() for hint in hints
 )
 _LOW_PRIORITY_LABEL_HINTS = (
     "sdh", "cc", "closed caption", "hearing", "听障", "聽障",
@@ -105,7 +134,57 @@ def _normalized_lang_token(lang: str) -> str:
     return (lang or "und").strip().replace("_", "-").lower()
 
 
-def _subtitle_category(lang: str, label: str) -> str | None:
+def _language_code_aliases(code: str) -> set[str]:
+    normalized = (code or "").strip().lower()
+    if not normalized:
+        return set()
+    aliases = {normalized, *_TRACK_LANG_ALIASES.get(normalized, set())}
+    for track_code, bcp47 in _LANG_BCP47.items():
+        if bcp47.lower() == normalized:
+            aliases.add(track_code)
+    return aliases
+
+
+def _track_matches_language_code(lang: str, language_code: str) -> bool:
+    normalized_lang = _normalized_lang_token(lang)
+    aliases = _language_code_aliases(language_code)
+    return normalized_lang in aliases or _bcp47_language(lang).lower() in aliases
+
+
+def _label_matches_language_code(label: str, language_code: str) -> bool:
+    normalized_label = (label or "").strip().lower()
+    hints = _ORIGINAL_LABEL_HINTS_BY_LANG.get(language_code.strip().lower(), ())
+    return any(hint in normalized_label for hint in hints)
+
+
+def _infer_track_language_code(lang: str, label: str) -> str | None:
+    normalized_lang = _normalized_lang_token(lang)
+    for code, aliases in _TRACK_LANG_ALIASES.items():
+        if normalized_lang in aliases or _bcp47_language(lang).lower() == code:
+            return code
+    normalized_label = (label or "").strip().lower()
+    for code, hints in _ORIGINAL_LABEL_HINTS_BY_LANG.items():
+        if any(hint in normalized_label for hint in hints):
+            return code
+    return None
+
+
+def _is_original_language_track(lang: str, label: str, original_language: str) -> bool:
+    code = original_language.strip().lower()
+    if _track_matches_language_code(lang, code):
+        return True
+    if _label_matches_language_code(label, code):
+        return True
+    normalized_label = (label or "").strip().lower()
+    if any(hint in normalized_label for hint in _GENERIC_ORIGINAL_LABEL_HINTS):
+        track_code = _infer_track_language_code(lang, label)
+        if track_code is None:
+            return True
+        return track_code == code
+    return False
+
+
+def _subtitle_category(lang: str, label: str, original_language: str | None = None) -> str | None:
     normalized_lang = _normalized_lang_token(lang)
     normalized_label = (label or "").strip().lower()
 
@@ -123,6 +202,13 @@ def _subtitle_category(lang: str, label: str) -> str | None:
     if normalized_lang in _EN_LANGS:
         return "en"
 
+    if original_language:
+        if _is_original_language_track(lang, label, original_language):
+            return "original"
+        if normalized_lang not in _NON_ORIGINAL_LANGS:
+            return None
+        return None
+
     if any(hint in normalized_label for hint in _ORIGINAL_LABEL_HINTS):
         return "original"
     if normalized_lang not in _NON_ORIGINAL_LANGS:
@@ -130,7 +216,11 @@ def _subtitle_category(lang: str, label: str) -> str | None:
     return None
 
 
-def _subtitle_score(stream: dict, label: str) -> tuple[int, int, int]:
+def _subtitle_score(
+    stream: dict,
+    label: str,
+    original_language: str | None = None,
+) -> tuple[int, int, int]:
     disposition = stream.get("disposition") or {}
     normalized_label = (label or "").strip().lower()
     quality_penalty = 0
@@ -144,17 +234,26 @@ def _subtitle_score(stream: dict, label: str) -> tuple[int, int, int]:
         quality_penalty -= 5
     if disposition.get("comment"):
         quality_penalty += 20
+    if original_language:
+        tags = stream.get("tags") or {}
+        track_lang = tags.get("language", "und")
+        if _is_original_language_track(track_lang, label, original_language):
+            quality_penalty -= 10
     return (quality_penalty, int(stream.get("subtitle_index") or 0), int(stream.get("index") or 0))
 
 
-def _preferred_subtitle_streams(streams: list[dict], print_fn=print) -> list[dict]:
+def _preferred_subtitle_streams(
+    streams: list[dict],
+    print_fn=print,
+    original_language: str | None = None,
+) -> list[dict]:
     candidates_by_category: dict[str, list[dict]] = {category: [] for category in _SUBTITLE_CATEGORY_ORDER}
     for subtitle_index, stream in enumerate(streams):
         tags = stream.get("tags") or {}
         lang = tags.get("language", "und")
         title = tags.get("title", "")
         label = title or _LANG_LABELS.get(lang, lang)
-        category = _subtitle_category(lang, label)
+        category = _subtitle_category(lang, label, original_language)
         if not category:
             continue
         item = {
@@ -163,7 +262,11 @@ def _preferred_subtitle_streams(streams: list[dict], print_fn=print) -> list[dic
             "lang": lang,
             "label": label,
             "category": category,
-            "score": _subtitle_score({**stream, "subtitle_index": subtitle_index}, label),
+            "score": _subtitle_score(
+                {**stream, "subtitle_index": subtitle_index},
+                label,
+                original_language,
+            ),
         }
         candidates_by_category.setdefault(category, []).append(item)
 
@@ -247,9 +350,17 @@ def _parse_hls_media_segments(playlist_path: Path) -> list[float]:
     return durations
 
 
+def _hls_media_playlist(output_dir: Path) -> Path | None:
+    for name in ("stream-v.m3u8", "stream.m3u8"):
+        candidate = output_dir / name
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def _probe_hls_media_start(output_dir: Path, print_fn=print) -> float:
-    playlist = output_dir / "stream.m3u8"
-    if not playlist.exists():
+    playlist = _hls_media_playlist(output_dir)
+    if not playlist:
         return 0.0
     cmd = [
         settings.FFPROBE_BIN,
@@ -395,7 +506,7 @@ def generate_hls_subtitle_playlists(
     used_dirs: dict[str, int] = {}
     used_names: dict[str, int] = {}
     media_start_time = _probe_hls_media_start(output_dir, print_fn=print_fn)
-    segment_durations = _parse_hls_media_segments(output_dir / "stream.m3u8")
+    segment_durations = _parse_hls_media_segments(_hls_media_playlist(output_dir) or output_dir / "stream-v.m3u8")
     if segment_durations:
         print_fn(
             f"   HLS 字幕时间线: media_start={media_start_time:.3f}s, "
@@ -438,8 +549,16 @@ def generate_hls_subtitle_playlists(
     return subtitle_tracks
 
 
-def extract_subtitles(input_path: str, output_dir: Path, print_fn=None) -> list[dict]:
-    """从 MKV/MP4 提取所有字幕轨 → .vtt 文件。"""
+def extract_subtitles(
+    input_path: str,
+    output_dir: Path,
+    print_fn=None,
+    original_language: str | None = None,
+) -> list[dict]:
+    """从 MKV/MP4 提取所有字幕轨 → .vtt 文件。
+
+    original_language: TMDB original_language（ISO 639-1），用于判定「原声」字幕轨。
+    """
     if print_fn is None:
         print_fn = print
 
@@ -459,7 +578,11 @@ def extract_subtitles(input_path: str, output_dir: Path, print_fn=None) -> list[
     if not streams:
         return []
 
-    selected_streams = _preferred_subtitle_streams(streams, print_fn=print_fn)
+    selected_streams = _preferred_subtitle_streams(
+        streams,
+        print_fn=print_fn,
+        original_language=original_language,
+    )
     if not selected_streams:
         return []
 

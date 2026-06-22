@@ -204,7 +204,6 @@ def generate_hls_master(slice_result: dict, output_dir: Path, print_fn=None, sub
     width = slice_result["width"]
     height = slice_result["height"]
     audio_tracks = slice_result.get("audioTracks", [])
-    is_apple_hls = bool(slice_result.get("appleHLS"))
 
     lines = [
         "#EXTM3U",
@@ -213,10 +212,7 @@ def generate_hls_master(slice_result: dict, output_dir: Path, print_fn=None, sub
     ]
     lines.append("")
 
-    if is_apple_hls:
-        pass
-    elif audio_tracks and len(audio_tracks) > 1:
-        # 多音轨: 每个音轨一个 EXT-X-MEDIA 条目
+    if audio_tracks:
         _LANG_NAMES = {
             'zho': '国语', 'chi': '国语', 'cmn': '国语', 'zh': '国语',
             'yue': '粤语', 'can': '粤语',
@@ -225,35 +221,59 @@ def generate_hls_master(slice_result: dict, output_dir: Path, print_fn=None, sub
             'kor': '韩语', 'ko': '韩语',
             'und': '默认',
         }
-        for i, track in enumerate(audio_tracks):
-            lang = track["lang"]
-            title = track.get("title") or _LANG_NAMES.get(lang, f"音轨 {i+1}")
+        autoselected_langs: set[str] = set()
+        for track in audio_tracks:
+            lang = track.get("lang") or "und"
+            title = track.get("title") or _LANG_NAMES.get(lang, f"音轨 {lang}")
             m3u8 = track["m3u8"]
             channels = int(track.get("channels") or 2)
-            is_default = "YES" if i == 0 else "NO"
-            lines.append(
-                f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{_hls_attr(title)}",'
-                f'LANGUAGE="{_hls_attr(lang)}",DEFAULT={is_default},AUTOSELECT={is_default},'
-                f'CHANNELS="{channels}",URI="{_hls_attr(m3u8)}"'
-            )
+            is_default = "YES" if track.get("is_default") else "NO"
+            is_autoselect = "YES" if lang not in autoselected_langs else "NO"
+            if is_autoselect == "YES":
+                autoselected_langs.add(lang)
+            attrs = [
+                'TYPE=AUDIO', 'GROUP-ID="audio"', f'NAME="{_hls_attr(title)}"',
+                f'LANGUAGE="{_hls_attr(lang)}"', f"DEFAULT={is_default}",
+                f"AUTOSELECT={is_autoselect}", f'CHANNELS="{channels}"',
+                f'URI="{_hls_attr(m3u8)}"',
+            ]
+            characteristics = track.get("characteristics")
+            if characteristics:
+                attrs.append(f'CHARACTERISTICS="{_hls_attr(characteristics)}"')
+            lines.append(f'#EXT-X-MEDIA:{",".join(attrs)}')
         lines.append("")
     else:
-        # 单音轨
-        audio_m3u8 = slice_result.get("hlsAudio", "stream-a.m3u8")
-        channels = 2
-        if audio_tracks:
-            channels = int(audio_tracks[0].get("channels") or 2)
+        audio_m3u8 = slice_result.get("hlsAudio", "stream-a0.m3u8")
         lines.append(
             f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="默认音轨",'
-            f'DEFAULT=YES,AUTOSELECT=YES,CHANNELS="{channels}",URI="{_hls_attr(audio_m3u8)}"'
+            f'LANGUAGE="und",DEFAULT=YES,AUTOSELECT=YES,CHANNELS="2",'
+            f'URI="{_hls_attr(audio_m3u8)}"'
         )
         lines.append("")
 
-    # 字幕轨
+    default_audio_codec = slice_result.get("audioCodec", acodec)
+    if audio_tracks:
+        for track in audio_tracks:
+            if track.get("is_default") and track.get("audioCodec"):
+                default_audio_codec = track["audioCodec"]
+                break
+    acodec = default_audio_codec
+
+    # 字幕轨：默认选中简体（若有），避免韩/日原声轨 DEFAULT=YES
     if subtitles_info:
+        default_index = 0
+        for i, sub in enumerate(subtitles_info):
+            lang = str(sub.get("lang") or "").lower()
+            name = str(sub.get("name") or "")
+            if lang in ("zh-hans", "zhs", "chi", "zho", "zh", "cmn") or any(
+                hint in name for hint in ("简体", "简中", "简体中文")
+            ):
+                if "繁" not in name and "traditional" not in name.lower():
+                    default_index = i
+                    break
         autoselected_langs: set[str] = set()
         for i, sub in enumerate(subtitles_info):
-            is_default = "YES" if i == 0 else "NO"
+            is_default = "YES" if i == default_index else "NO"
             lang = str(sub["lang"])
             is_autoselect = "NO"
             if lang not in autoselected_langs:
@@ -268,15 +288,13 @@ def generate_hls_master(slice_result: dict, output_dir: Path, print_fn=None, sub
 
     stream_attrs = [
         f"BANDWIDTH={int(bandwidth)}",
+        f"AVERAGE-BANDWIDTH={int(average_bandwidth)}",
         f'CODECS="{_hls_attr(f"{vcodec},{acodec}")}"',
         f"RESOLUTION={width}x{height}",
     ]
-    if not is_apple_hls:
-        stream_attrs.insert(1, f"AVERAGE-BANDWIDTH={int(average_bandwidth)}")
     if frame_rate > 0:
         stream_attrs.append(f"FRAME-RATE={frame_rate:.3f}".rstrip("0").rstrip("."))
-    if not is_apple_hls:
-        stream_attrs.append('AUDIO="audio"')
+    stream_attrs.append('AUDIO="audio"')
     if subtitles_info:
         stream_attrs.append('SUBTITLES="subs"')
     lines.append(f"#EXT-X-STREAM-INF:{','.join(stream_attrs)}")

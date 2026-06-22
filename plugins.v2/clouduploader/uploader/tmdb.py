@@ -2,45 +2,99 @@
 TMDB API 封装（插件内嵌版）
 
 认证自动兼容 TMDB v4 Bearer Token 与 v3 API Key（见 runtime_config.tmdb_auth）。
+直连失败时自动回退到 TMDB 代理（见 tmdb_http）。
 """
-import httpx
-
-from .runtime_config import settings
-
-
-def _get(url: str, extra_params: dict, timeout: int = 15) -> httpx.Response:
-    auth = settings.tmdb_auth
-    params = {**auth["params"], **extra_params}
-    return httpx.get(url, params=params, headers=auth["headers"], timeout=timeout)
+from .tmdb_http import tmdb_get_json, tmdb_get_status
 
 
 def search_tmdb(query: str, media_type: str = "tv") -> list:
     """搜索 TMDB，返回最多 5 条结果。"""
-    resp = _get(
-        f"https://api.themoviedb.org/3/search/{media_type}",
-        {"query": query, "language": "zh-CN", "page": 1},
+    data = tmdb_get_json(
+        f"/search/{media_type}",
+        {"query": query, "page": 1},
     )
-    resp.raise_for_status()
-    return resp.json().get("results", [])[:5]
+    return data.get("results", [])[:5]
 
 
 def search_tmdb_multi(query: str) -> list:
     """搜索 TMDB multi 接口（同时搜 movie + tv），返回最多 5 条。"""
-    resp = _get(
-        "https://api.themoviedb.org/3/search/multi",
-        {"query": query, "language": "zh-CN", "page": 1},
+    data = tmdb_get_json(
+        "/search/multi",
+        {"query": query, "page": 1},
     )
-    resp.raise_for_status()
-    results = resp.json().get("results", [])
+    results = data.get("results", [])
     return [r for r in results if r.get("media_type") in ("movie", "tv")][:5]
 
 
 def detect_media_type_by_id(tmdb_id: int) -> str:
     """通过 TMDB ID 自动检测 movie / tv，默认 movie。"""
-    resp = _get(f"https://api.themoviedb.org/3/movie/{tmdb_id}", {"language": "zh-CN"}, timeout=10)
-    if resp.status_code == 200:
+    if tmdb_get_status(f"/movie/{tmdb_id}", timeout=10) == 200:
         return "movie"
-    resp = _get(f"https://api.themoviedb.org/3/tv/{tmdb_id}", {"language": "zh-CN"}, timeout=10)
-    if resp.status_code == 200:
+    if tmdb_get_status(f"/tv/{tmdb_id}", timeout=10) == 200:
         return "tv"
     return "movie"
+
+
+def verify_tmdb_metadata(
+    tmdb_id: int,
+    media_type: str = "tv",
+    season: int | None = None,
+    episode: int | None = None,
+) -> tuple[bool, str, str | None]:
+    """上传前校验 TMDB 元数据是否可查。
+
+    Returns:
+        (ok, resolved_media_type, error_message)
+    """
+    requested = (media_type or "tv").strip().lower()
+    if requested not in ("movie", "tv"):
+        requested = "tv"
+
+    def _fetch_show(kind: str) -> dict | None:
+        try:
+            data = tmdb_get_json(f"/{kind}/{tmdb_id}", timeout=10) or {}
+        except Exception:
+            return None
+        if data.get("id"):
+            return data
+        return None
+
+    data = _fetch_show(requested)
+    resolved = requested
+    if data is None:
+        alternate = "movie" if requested == "tv" else "tv"
+        data = _fetch_show(alternate)
+        resolved = alternate
+
+    if data is None:
+        return False, requested, f"TMDB 未找到元数据: ID {tmdb_id}"
+
+    if resolved == "tv" and season is not None and episode is not None:
+        try:
+            ep = tmdb_get_json(
+                f"/tv/{tmdb_id}/season/{int(season)}/episode/{int(episode)}",
+                timeout=10,
+            ) or {}
+        except Exception as exc:
+            return False, resolved, f"TMDB 分集查询失败 S{int(season)}E{int(episode)}: {exc}"
+        if not ep.get("id"):
+            return False, resolved, f"TMDB 未找到分集: S{int(season)}E{int(episode)}"
+
+    return True, resolved, None
+
+
+def get_original_language(tmdb_id: int, media_type: str = "tv") -> tuple[str | None, str | None]:
+    """读取 TMDB 作品的 original_language（ISO 639-1，如 ko/ja/en）。
+
+    Returns:
+        (language, error_message)
+    """
+    try:
+        data = tmdb_get_json(f"/{media_type}/{tmdb_id}", timeout=10) or {}
+    except Exception as exc:
+        return None, str(exc)
+    lang = data.get("original_language")
+    if not lang:
+        return None, "TMDB 响应缺少 original_language"
+    normalized = str(lang).strip().lower()
+    return (normalized or None), None
