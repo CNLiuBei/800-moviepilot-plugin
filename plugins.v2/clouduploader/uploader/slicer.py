@@ -1,14 +1,12 @@
 """
-Apple HLS / CMAF 切片模块（插件内嵌版）。
+HLS fMP4 切片模块（插件内嵌版）。
 
-FFmpeg/ffprobe 用于探测与 stream copy 拆轨；mediafilesegmenter 以 CMAF fMP4 切片。
-视频 H.264/HEVC stream copy；音轨 AAC 可 copy，杜比/FLAC 等转 AAC 以兼容 Chrome/Firefox。
+FFmpeg 一次性完成：视频 copy + TMDB 默认音轨（杜比等转 AAC）→ stream.m3u8 + init.mp4 + seg-*.m4s。
+生成后由 mediastreamvalidator 校验（见 job_runner）。
 """
 import json
 import math
-import shutil
 import subprocess
-import tempfile
 from pathlib import Path
 
 from .runtime_config import settings
@@ -28,10 +26,6 @@ _TRANSCODE_TO_AAC_AUDIO_CODECS = frozenset({
     "eac3", "eac-3", "ec-3",
     "flac", "alac",
 })
-
-
-def _tool_available(path: str) -> bool:
-    return bool(shutil.which(path) or (Path(path).is_absolute() and Path(path).is_file()))
 
 
 def get_video_duration(filepath: str) -> int | None:
@@ -311,177 +305,15 @@ def _is_copyable_audio_codec(codec: str) -> bool:
     return (codec or "").strip().lower() in _COPYABLE_AUDIO_CODECS
 
 
-def _audio_mezzanine_ext(codec: str) -> str:
-    """AAC 用 .m4a；AC-3/E-AC-3 等须用 .mp4 容器才能 stream copy。"""
-    if (codec or "").strip().lower() in {"aac", "mp4a"}:
-        return ".m4a"
-    return ".mp4"
-
-
-def _remux_stream_copy(input_path: str, output_path: Path, stream_map: str, print_fn) -> bool:
-    cmd = [
-        settings.FFMPEG_BIN, "-i", input_path,
-        "-map", stream_map, "-c", "copy",
-        "-movflags", "+faststart",
-        str(output_path), "-y",
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
-    if result.returncode != 0 or not output_path.exists():
-        print_fn(f"   stream copy 失败 ({stream_map}):\n{result.stderr[-500:]}")
-        return False
-    return True
-
-
-def _prepare_audio_mezzanine(
-    input_path: str,
-    output_path: Path,
-    track: dict,
-    print_fn,
-) -> bool:
-    """音轨：AAC stream copy；杜比/FLAC 等转 AAC 以兼容 Chrome/Firefox MSE。"""
-    stream_map = f"0:a:{track['audio_index']}"
-    codec = (track.get("codec") or "").lower()
-    label = track.get("title") or track.get("lang") or "音轨"
-    channels = int(track.get("channels") or 2)
-
-    if not _should_transcode_audio_to_aac(codec):
-        codec_label = _audio_codec_string(codec)
-        ch_info = f" / {channels}ch" if channels > 2 else ""
-        print_fn(f"      [{track['lang']}] {label}: {codec} copy ({codec_label}{ch_info})")
-        return _remux_stream_copy(input_path, output_path, stream_map, print_fn)
-
-    transcode_channels = min(channels, settings.CMAF_AUDIO_CHANNELS)
-    print_fn(
-        f"      [{track['lang']}] {label}: {codec or '?'} → AAC "
-        f"{settings.CMAF_AUDIO_BITRATE} / {transcode_channels}ch"
-    )
-    cmd = [
-        settings.FFMPEG_BIN, "-i", input_path,
-        "-map", stream_map,
-        "-c:a", "aac", "-b:a", settings.CMAF_AUDIO_BITRATE,
-        "-ac", str(transcode_channels),
-        "-movflags", "+faststart",
-        str(output_path), "-y",
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
-    if result.returncode != 0 or not output_path.exists():
-        print_fn(f"   音轨转 AAC 失败 ({stream_map}):\n{result.stderr[-500:]}")
-        return False
-    return True
-
-
-def _run_mediafilesegmenter_cmaf(
-    mezzanine: Path,
-    work_dir: Path,
-    print_fn,
-    *,
-    track_type: str = "video",
-) -> bool:
-    """CMAF 音画分离切片：须指定 --video-only 或 --audio-only。"""
-    work_dir.mkdir(parents=True, exist_ok=True)
-    segmenter = settings.MEDIAFILESEGMENTER_BIN
-    target = str(settings.HLS_SEGMENT_SECONDS)
-    track_flag = "-A" if track_type == "video" else "-a"
-    cmd = [
-        segmenter, "--format", "cmaf", track_flag,
-        "--file-base", str(work_dir),
-        "--target-duration", target,
-        "--base-media-file-name", "seg-",
-        "--index-file", "stream.m3u8",
-        "--iframe-index-file", "none",
-        str(mezzanine),
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
-    if result.returncode == 0:
-        return True
-    print_fn(f"   mediafilesegmenter (CMAF {track_type}) 失败:\n{result.stderr[-500:]}")
-    return False
-
-
-def _find_segmenter_playlist(work_dir: Path) -> Path | None:
-    for name in ("stream.m3u8", "prog_index.m3u8", "index.m3u8"):
-        candidate = work_dir / name
-        if candidate.exists():
-            return candidate
-    playlists = sorted(work_dir.glob("*.m3u8"))
-    return playlists[0] if playlists else None
-
-
-def _finalize_cmaf_output(
-    work_dir: Path,
-    output_dir: Path,
-    *,
-    seg_token: str,
-    init_name: str,
-    playlist_name: str,
-) -> Path | None:
-    """将 mediafilesegmenter 输出规范为 init-*.mp4 / seg-*-NNNNN.m4s / stream-*.m3u8。"""
-    playlist_src = _find_segmenter_playlist(work_dir)
-    if not playlist_src:
-        return None
-
-    playlist_text = playlist_src.read_text(encoding="utf-8", errors="ignore")
-    init_src_name = "seg-0.mp4"
-    for line in playlist_text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("#EXT-X-MAP:") and 'URI="' in stripped:
-            init_src_name = stripped.split('URI="', 1)[1].split('"', 1)[0]
-            break
-
-    init_src = work_dir / init_src_name
-    if not init_src.is_file():
-        init_candidates = [
-            p for p in work_dir.iterdir()
-            if p.is_file() and p.suffix.lower() == ".mp4" and p.name.startswith("init")
-        ]
-        if not init_candidates:
-            init_candidates = [
-                p for p in work_dir.iterdir()
-                if p.is_file() and p.suffix.lower() == ".mp4" and p.name == "seg-0.mp4"
-            ]
-        if not init_candidates:
-            return None
-        init_src = init_candidates[0]
-
-    segment_map: dict[str, str] = {}
-    for seg in sorted(work_dir.glob("seg-*")):
-        if not seg.is_file():
-            continue
-        if seg.resolve() == init_src.resolve():
-            continue
-        if seg.suffix.lower() not in {".m4s", ".mp4", ".ts"}:
-            continue
-        segment_map[seg.name] = seg.name.replace("seg-", f"seg-{seg_token}-", 1)
-
-    init_dst = output_dir / init_name
-    if init_src.resolve() != init_dst.resolve():
-        if init_dst.exists():
-            init_dst.unlink()
-        shutil.move(str(init_src), str(init_dst))
-
-    for old_name, new_name in segment_map.items():
-        src = work_dir / old_name
-        dst = output_dir / new_name
-        if dst.exists():
-            dst.unlink()
-        shutil.move(str(src), str(dst))
-
-    lines: list[str] = []
-    for raw_line in playlist_text.splitlines():
-        line = raw_line
-        if line.strip() == "#EXT-X-INDEPENDENT-SEGMENTS":
-            continue
-        if "#EXT-X-MAP:" in line and "URI=" in line:
-            line = f'#EXT-X-MAP:URI="{init_name}"'
-        else:
-            stripped = line.strip()
-            if stripped in segment_map:
-                line = segment_map[stripped]
-        lines.append(line)
-
-    playlist_dst = output_dir / playlist_name
-    playlist_dst.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return playlist_dst
+def _normalize_media_playlist(playlist_path: Path) -> None:
+    """master 已声明 INDEPENDENT-SEGMENTS 时，media playlist 去重。"""
+    try:
+        lines = playlist_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return
+    filtered = [line for line in lines if line.strip() != "#EXT-X-INDEPENDENT-SEGMENTS"]
+    if filtered != lines:
+        playlist_path.write_text("\n".join(filtered) + "\n", encoding="utf-8")
 
 
 def apple_hls_slice(
@@ -490,12 +322,9 @@ def apple_hls_slice(
     print_fn=None,
     original_language: str | None = None,
 ) -> dict | None:
-    """CMAF fMP4 切片：视频 copy、全部音轨保留（TMDB 标原声默认，支持编码 copy）。"""
+    """FFmpeg fMP4 HLS：视频 copy + TMDB 默认音轨，一次性切片为 stream.m3u8。"""
     if print_fn is None:
         print_fn = print
-    if not _tool_available(settings.MEDIAFILESEGMENTER_BIN):
-        print_fn("   Apple mediafilesegmenter 未安装，跳过切片")
-        return None
 
     output_dir.mkdir(parents=True, exist_ok=True)
     probe_info = probe_video_info(input_path)
@@ -512,124 +341,100 @@ def apple_hls_slice(
         print_fn("   ❌ 源文件无可用音轨，无法切片")
         return None
 
+    default_track = next(t for t in selected_tracks if t.get("is_default"))
+    extra = len(selected_tracks) - 1
+    if extra:
+        print_fn(f"   ℹ️  另有 {extra} 条音轨未上架（仅 TMDB 默认音轨进主播放列表）")
+
+    audio_map = f"0:a:{default_track['audio_index']}"
+    codec = (default_track.get("codec") or "").lower()
+    label = default_track.get("title") or default_track.get("lang") or "音轨"
+    channels = int(default_track.get("channels") or 2)
+    transcode_channels = min(channels, settings.CMAF_AUDIO_CHANNELS)
+    segment_seconds = str(settings.HLS_SEGMENT_SECONDS)
+
     print_fn(
-        f"   CMAF 准备: 视频 {src_codec} copy | 音轨 {len(selected_tracks)} 条"
+        f"   FFmpeg fMP4 切片: 视频 {src_codec} copy + 默认音轨 "
+        f"[{default_track['lang']}] {label}"
     )
 
-    manifest_tracks: list[dict] = []
-    default_playlist: Path | None = None
-    default_codec_str = "mp4a.40.2"
-    default_bw = {"peak": 0, "average": 0}
-
-    with tempfile.TemporaryDirectory(prefix="gy-cmaf-hls-") as tmp:
-        tmp_dir = Path(tmp)
-        video_mezz = tmp_dir / "video.m4v"
-        if not _remux_stream_copy(input_path, video_mezz, "0:v:0", print_fn):
-            return None
-
-        video_work = tmp_dir / "video_out"
-        if not _run_mediafilesegmenter_cmaf(video_mezz, video_work, print_fn, track_type="video"):
-            return None
-        video_playlist = _finalize_cmaf_output(
-            video_work, output_dir,
-            seg_token="v", init_name="init-v.mp4", playlist_name="stream-v.m3u8",
+    cmd = [
+        settings.FFMPEG_BIN, "-i", input_path,
+        "-map", "0:v:0", "-map", audio_map,
+        "-c:v", "copy",
+        "-copyts", "-avoid_negative_ts", "make_zero",
+    ]
+    if _should_transcode_audio_to_aac(codec):
+        print_fn(
+            f"      音轨: {codec or '?'} → AAC "
+            f"{settings.CMAF_AUDIO_BITRATE} / {transcode_channels}ch"
         )
-        if not video_playlist:
-            print_fn("   ❌ 视频 CMAF 播放清单整理失败")
-            return None
+        cmd += [
+            "-c:a", "aac", "-b:a", settings.CMAF_AUDIO_BITRATE,
+            "-ac", str(transcode_channels),
+        ]
+    else:
+        codec_label = _audio_codec_string(codec)
+        ch_info = f" / {channels}ch" if channels > 2 else ""
+        print_fn(f"      音轨: {codec} copy ({codec_label}{ch_info})")
+        cmd += ["-c:a", "copy"]
 
-        for idx, track in enumerate(selected_tracks):
-            suffix = "a" if len(selected_tracks) == 1 else f"a{idx}"
-            audio_mezz = tmp_dir / f"audio_{idx}{_audio_mezzanine_ext(track.get('codec'))}"
-            if not _prepare_audio_mezzanine(input_path, audio_mezz, track, print_fn):
-                return None
+    playlist_path = output_dir / "stream.m3u8"
+    cmd += [
+        "-f", "hls",
+        "-hls_time", segment_seconds,
+        "-hls_playlist_type", "vod",
+        "-hls_segment_type", "fmp4",
+        "-hls_fmp4_init_filename", "init.mp4",
+        "-hls_segment_filename", str(output_dir / "seg-%d.m4s"),
+        str(playlist_path),
+        "-y",
+    ]
 
-            audio_work = tmp_dir / f"audio_out_{idx}"
-            if not _run_mediafilesegmenter_cmaf(audio_mezz, audio_work, print_fn, track_type="audio"):
-                return None
-            audio_playlist = _finalize_cmaf_output(
-                audio_work, output_dir,
-                seg_token=suffix,
-                init_name=f"init-{suffix}.mp4",
-                playlist_name=f"stream-{suffix}.m3u8",
-            )
-            if not audio_playlist:
-                print_fn(f"   ❌ 音轨 [{track['lang']}] CMAF 播放清单整理失败")
-                return None
-
-            source_codec = track.get("codec") or ""
-            transcoded = _should_transcode_audio_to_aac(source_codec)
-            codec_str = "mp4a.40.2" if transcoded else _audio_codec_string(source_codec)
-            manifest_channels = (
-                min(int(track.get("channels") or 2), settings.CMAF_AUDIO_CHANNELS)
-                if transcoded else int(track.get("channels") or 2)
-            )
-            if track.get("is_default"):
-                default_playlist = audio_playlist
-                default_codec_str = codec_str
-                default_bw = _measure_hls_bitrates(audio_playlist)
-
-            manifest_tracks.append({
-                "lang": track["lang"],
-                "title": track["title"],
-                "m3u8": f"stream-{suffix}.m3u8",
-                "channels": manifest_channels,
-                "suffix": suffix,
-                "init": f"init-{suffix}.mp4",
-                "audioCodec": codec_str,
-                "is_default": bool(track.get("is_default")),
-            })
-
-    video_segments = sorted(f.name for f in output_dir.glob("seg-v-*") if f.is_file())
-    audio_segments = sorted(
-        f.name for f in output_dir.glob("seg-a*-*") if f.is_file()
-    )
-    if not video_segments or not audio_segments or not default_playlist:
-        print_fn("   ❌ CMAF 未生成音视频分片")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=14400)
+    if result.returncode != 0 or not playlist_path.is_file():
+        print_fn(f"   ❌ FFmpeg HLS 切片失败:\n{result.stderr[-800:]}")
         return None
 
+    _normalize_media_playlist(playlist_path)
+
+    segments = sorted(f.name for f in output_dir.glob("seg-*.m4s") if f.is_file())
+    if not segments or not (output_dir / "init.mp4").is_file():
+        print_fn("   ❌ FFmpeg 未生成 init.mp4 或分片")
+        return None
+
+    source_codec = default_track.get("codec") or ""
+    transcoded = _should_transcode_audio_to_aac(source_codec)
+    audio_codec_str = "mp4a.40.2" if transcoded else _audio_codec_string(source_codec)
     video_codec_str = _codec_string_for_master(src_codec, probe_info)
-    video_bw = _measure_hls_bitrates(video_playlist)
-    bandwidth = (video_bw["peak"] + default_bw["peak"]) or probe_info["bitrate"]
-    average_bandwidth = (
-        video_bw["average"] + default_bw["average"]
-    ) or probe_info.get("average_bitrate") or bandwidth
+    combined_bw = _measure_hls_bitrates(playlist_path)
+    bandwidth = combined_bw["peak"] or probe_info["bitrate"]
+    average_bandwidth = combined_bw["average"] or probe_info.get("average_bitrate") or bandwidth
 
     width = probe_info["width"]
     height = probe_info["height"]
     duration = probe_info["duration"]
-    default_track = next(item for item in manifest_tracks if item.get("is_default"))
     print_fn(
-        f"   ✅ CMAF fMP4: 视频 {len(video_segments)} 片段 + "
-        f"{len(manifest_tracks)} 音轨 / {len(audio_segments)} 音频分片 | {width}x{height}"
+        f"   ✅ fMP4 HLS: {len(segments)} 片段 | {width}x{height} | "
+        f"音轨 [{default_track['lang']}] {default_track['title']}"
     )
     return {
-        "videoSegments": video_segments,
-        "audioSegments": audio_segments,
-        "audioTracks": manifest_tracks,
-        "hlsVideo": "stream-v.m3u8",
-        "hlsAudio": default_track["m3u8"],
-        "audioInit": default_track["init"],
+        "videoSegments": segments,
+        "audioSegments": segments,
+        "hlsVideo": "stream.m3u8",
+        "hlsAudio": "stream.m3u8",
+        "audioInit": "init.mp4",
+        "defaultAudioLang": default_track["lang"],
+        "defaultAudioTitle": default_track["title"],
         "duration": duration,
         "videoCodec": video_codec_str,
-        "audioCodec": default_codec_str,
+        "audioCodec": audio_codec_str,
         "width": width,
         "height": height,
         "bandwidth": bandwidth,
         "averageBandwidth": average_bandwidth,
         "frameRate": probe_info.get("frame_rate") or 0.0,
     }
-
-
-def _remove_independent_segments_tag(playlist_path: Path) -> None:
-    """Apple HLS master 统一声明 independent segments，media playlist 去重。"""
-    try:
-        lines = playlist_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    except OSError:
-        return
-    filtered = [line for line in lines if line.strip() != "#EXT-X-INDEPENDENT-SEGMENTS"]
-    if filtered != lines:
-        playlist_path.write_text("\n".join(filtered) + "\n", encoding="utf-8")
 
 
 def _h264_profile_hex(profile: str) -> str:

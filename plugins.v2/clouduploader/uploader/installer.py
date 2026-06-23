@@ -6,7 +6,7 @@
 
 所有探测/安装结果回写到 runtime_config.settings 的 *_BIN 字段。
 
-注：Apple HTTP Live Streaming Tools 只能探测，不自动安装；缺失时切片任务会失败。
+注：切片由 FFmpeg 完成；mediastreamvalidator 仅用于校验，缺失时跳过校验。
 """
 from __future__ import annotations
 
@@ -86,23 +86,17 @@ def ensure_all(log=print) -> dict:
     """
     has_ffmpeg, has_ffprobe = ensure_ffmpeg(log=log)
     has_packager = ensure_packager(log=log)
-    apple_hls = ensure_apple_hls_tools(log=log)
+    has_validator = ensure_mediastreamvalidator(log=log)
     return {
         "ffmpeg": has_ffmpeg,
         "ffprobe": has_ffprobe,
         "packager": has_packager,
-        "apple_hls": apple_hls["available"],
-        "mediafilesegmenter": apple_hls["mediafilesegmenter"],
-        "mediasubtitlesegmenter": apple_hls["mediasubtitlesegmenter"],
-        "variantplaylistcreator": apple_hls["variantplaylistcreator"],
-        "mediastreamvalidator": apple_hls["mediastreamvalidator"],
+        "apple_hls": has_validator,
+        "mediastreamvalidator": has_validator,
         "ffmpeg_path": settings.FFMPEG_BIN,
         "ffprobe_path": settings.FFPROBE_BIN,
         "packager_path": settings.PACKAGER_BIN if has_packager else None,
-        "mediafilesegmenter_path": settings.MEDIAFILESEGMENTER_BIN if apple_hls["mediafilesegmenter"] else None,
-        "mediasubtitlesegmenter_path": settings.MEDIASUBTITLESEGMENTER_BIN if apple_hls["mediasubtitlesegmenter"] else None,
-        "variantplaylistcreator_path": settings.VARIANTPLAYLISTCREATOR_BIN if apple_hls["variantplaylistcreator"] else None,
-        "mediastreamvalidator_path": settings.MEDIASTREAMVALIDATOR_BIN if apple_hls["mediastreamvalidator"] else None,
+        "mediastreamvalidator_path": settings.MEDIASTREAMVALIDATOR_BIN if has_validator else None,
     }
 
 
@@ -138,25 +132,12 @@ def _resolve_tool(configured: str) -> str | None:
     return None
 
 
-def ensure_apple_hls_tools(log=print) -> dict:
-    """探测 Apple HTTP Live Streaming Tools。官方工具需用户预先安装。"""
-    tools = {
-        "mediafilesegmenter": "MEDIAFILESEGMENTER_BIN",
-        "mediasubtitlesegmenter": "MEDIASUBTITLESEGMENTER_BIN",
-        "variantplaylistcreator": "VARIANTPLAYLISTCREATOR_BIN",
-        "mediastreamvalidator": "MEDIASTREAMVALIDATOR_BIN",
-    }
-    result: dict[str, bool] = {}
-    for name, setting_name in tools.items():
-        configured = getattr(settings, setting_name)
-        resolved = _resolve_tool(configured)
-        if resolved:
-            setattr(settings, setting_name, resolved)
-        result[name] = bool(resolved)
-
-    result["available"] = result["mediafilesegmenter"] and result["mediastreamvalidator"]
-    if result["available"]:
-        log(f"   Apple HLS Tools: mediafilesegmenter={settings.MEDIAFILESEGMENTER_BIN}")
-    else:
-        log("   Apple HLS Tools: 未完整安装（切片任务会失败）")
-    return result
+def ensure_mediastreamvalidator(log=print) -> bool:
+    """探测 Apple mediastreamvalidator（HLS 校验，可选）。"""
+    resolved = _resolve_tool(settings.MEDIASTREAMVALIDATOR_BIN)
+    if resolved:
+        settings.MEDIASTREAMVALIDATOR_BIN = resolved
+        log(f"   mediastreamvalidator: {resolved}")
+        return True
+    log("   mediastreamvalidator: 未安装（将跳过 Apple 官方校验）")
+    return False

@@ -8,7 +8,7 @@ MoviePilot 插件仓库。
 
 整理完成后自动 **Apple HLS 切片 → R2 上传 → TMDB 元数据 → 站点入库**，全流程在插件进程内完成，无需独立服务。
 
-- 切片器使用 Apple HTTP Live Streaming Tools（`mediafilesegmenter` / `mediastreamvalidator`），未安装或校验失败时任务直接失败
+- 切片由 **FFmpeg** 生成 fMP4 HLS；可选 `mediastreamvalidator` 校验
 - `ffmpeg`/`ffprobe` 用于源文件探测和中间 MP4 准备，优先用系统自带、缺失回退 pip（`static-ffmpeg`）；Apple 官方 HLS Tools 需从 Apple Developer 下载并手动安装
 - 配置全部在插件界面填写（R2 / TMDB / 站点凭证），无需 `.env`
 - 详情页显示环境检测与任务队列状态

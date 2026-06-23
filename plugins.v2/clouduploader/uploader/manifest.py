@@ -17,7 +17,7 @@ class HLSValidationError(Exception):
 def repair_hls_target_duration(playlist_path: Path, print_fn=None) -> bool:
     """
     修正 #EXT-X-TARGETDURATION，使其不小于所有 #EXTINF 时长的向上取整。
-    mediafilesegmenter 偶发写出偏小的 TARGETDURATION（如 6 vs 6.465s）。
+    FFmpeg 偶发写出偏小的 TARGETDURATION（如 6 vs 6.465s）。
     返回 True 表示已改写文件。
     """
     if not playlist_path.exists():
@@ -117,11 +117,18 @@ def validate_hls_media_playlist(playlist_path: Path, track_type: str, print_fn=N
             )
 
     # Check #EXT-X-MAP
-    expected_init = "init-v.mp4" if track_type == "video" else "init-a"
-    has_map = any('#EXT-X-MAP:URI="' in line and expected_init in line for line in lines)
+    if track_type == "stream":
+        has_map = any('#EXT-X-MAP:URI="' in line for line in lines)
+    elif track_type == "video":
+        expected_init = "init-v.mp4"
+        has_map = any('#EXT-X-MAP:URI="' in line and expected_init in line for line in lines)
+    else:
+        expected_init = "init-a"
+        has_map = any('#EXT-X-MAP:URI="' in line and expected_init in line for line in lines)
     if not has_map:
+        hint = "init" if track_type == "stream" else expected_init
         raise HLSValidationError(
-            f'播放列表缺少 #EXT-X-MAP:URI 包含 "{expected_init}": {playlist_path}'
+            f'播放列表缺少 #EXT-X-MAP:URI ({hint}): {playlist_path}'
         )
 
     # Check #EXT-X-TARGETDURATION
@@ -202,8 +209,7 @@ def _extract_target_duration(playlist_path: Path) -> int:
 
 def validate_hls_media_playlists(output_dir: Path, print_fn=None) -> dict:
     """
-    验证视频和音频 HLS Media Playlists 的完整性。
-    自动检测音频 playlist 命名（stream-a.m3u8 或 stream-a0.m3u8）。
+    验证 FFmpeg 生成的 stream.m3u8 媒体播放列表。
 
     Returns:
         字典包含 videoSegments, audioSegments, videoTargetDuration, audioTargetDuration
@@ -211,33 +217,19 @@ def validate_hls_media_playlists(output_dir: Path, print_fn=None) -> dict:
     if print_fn is None:
         print_fn = print
 
-    video_playlist = output_dir / "stream-v.m3u8"
-
-    print_fn("   🔍 验证 stream-v.m3u8...")
-    video_segments = validate_hls_media_playlist(video_playlist, "video", print_fn=print_fn)
-    print_fn(f"   ✅ stream-v.m3u8: {len(video_segments)} 片段, "
-             f"总时长 {sum(s['duration'] for s in video_segments):.2f}s")
-
-    audio_playlists = sorted(output_dir.glob("stream-a*.m3u8"))
-    if not audio_playlists:
-        raise HLSValidationError("缺少音频播放列表 stream-a*.m3u8")
-
-    audio_segments = []
-    audio_target_duration = 0
-    for audio_playlist in audio_playlists:
-        print_fn(f"   🔍 验证 {audio_playlist.name}...")
-        segments = validate_hls_media_playlist(audio_playlist, "audio", print_fn=print_fn)
-        if not audio_segments:
-            audio_segments = segments
-        audio_target_duration = max(audio_target_duration, _extract_target_duration(audio_playlist))
-        print_fn(f"   ✅ {audio_playlist.name}: {len(segments)} 片段, "
-                 f"总时长 {sum(s['duration'] for s in segments):.2f}s")
-
+    playlist = output_dir / "stream.m3u8"
+    print_fn("   🔍 验证 stream.m3u8...")
+    segments = validate_hls_media_playlist(playlist, "stream", print_fn=print_fn)
+    print_fn(
+        f"   ✅ stream.m3u8: {len(segments)} 片段, "
+        f"总时长 {sum(s['duration'] for s in segments):.2f}s"
+    )
+    target = _extract_target_duration(playlist)
     return {
-        "videoSegments": video_segments,
-        "audioSegments": audio_segments,
-        "videoTargetDuration": _extract_target_duration(video_playlist),
-        "audioTargetDuration": audio_target_duration,
+        "videoSegments": segments,
+        "audioSegments": segments,
+        "videoTargetDuration": target,
+        "audioTargetDuration": target,
     }
 
 
@@ -249,7 +241,7 @@ def _hls_attr(value: object) -> str:
 
 
 def generate_hls_master(slice_result: dict, output_dir: Path, print_fn=None, subtitles_info: list[dict] | None = None) -> str:
-    """生成 HLS Master Playlist (master.m3u8)，支持多音轨和多字幕轨。"""
+    """生成 HLS Master Playlist (master.m3u8)。"""
     if print_fn is None:
         print_fn = print
 
@@ -260,63 +252,14 @@ def generate_hls_master(slice_result: dict, output_dir: Path, print_fn=None, sub
     frame_rate = float(slice_result.get("frameRate") or 0)
     width = slice_result["width"]
     height = slice_result["height"]
-    audio_tracks = slice_result.get("audioTracks", [])
 
     lines = [
         "#EXTM3U",
         "#EXT-X-VERSION:7",
         "#EXT-X-INDEPENDENT-SEGMENTS",
+        "",
     ]
-    lines.append("")
 
-    if audio_tracks:
-        _LANG_NAMES = {
-            'zho': '国语', 'chi': '国语', 'cmn': '国语', 'zh': '国语',
-            'yue': '粤语', 'can': '粤语',
-            'eng': '英语', 'en': '英语',
-            'jpn': '日语', 'ja': '日语',
-            'kor': '韩语', 'ko': '韩语',
-            'und': '默认',
-        }
-        autoselected_langs: set[str] = set()
-        for track in audio_tracks:
-            lang = track.get("lang") or "und"
-            title = track.get("title") or _LANG_NAMES.get(lang, f"音轨 {lang}")
-            m3u8 = track["m3u8"]
-            channels = int(track.get("channels") or 2)
-            is_default = "YES" if track.get("is_default") else "NO"
-            is_autoselect = "YES" if lang not in autoselected_langs else "NO"
-            if is_autoselect == "YES":
-                autoselected_langs.add(lang)
-            attrs = [
-                'TYPE=AUDIO', 'GROUP-ID="audio"', f'NAME="{_hls_attr(title)}"',
-                f'LANGUAGE="{_hls_attr(lang)}"', f"DEFAULT={is_default}",
-                f"AUTOSELECT={is_autoselect}", f'CHANNELS="{channels}"',
-                f'URI="{_hls_attr(m3u8)}"',
-            ]
-            characteristics = track.get("characteristics")
-            if characteristics:
-                attrs.append(f'CHARACTERISTICS="{_hls_attr(characteristics)}"')
-            lines.append(f'#EXT-X-MEDIA:{",".join(attrs)}')
-        lines.append("")
-    else:
-        audio_m3u8 = slice_result.get("hlsAudio", "stream-a0.m3u8")
-        lines.append(
-            f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="默认音轨",'
-            f'LANGUAGE="und",DEFAULT=YES,AUTOSELECT=YES,CHANNELS="2",'
-            f'URI="{_hls_attr(audio_m3u8)}"'
-        )
-        lines.append("")
-
-    default_audio_codec = slice_result.get("audioCodec", acodec)
-    if audio_tracks:
-        for track in audio_tracks:
-            if track.get("is_default") and track.get("audioCodec"):
-                default_audio_codec = track["audioCodec"]
-                break
-    acodec = default_audio_codec
-
-    # 字幕轨：默认选中简体（若有），避免韩/日原声轨 DEFAULT=YES
     if subtitles_info:
         default_index = 0
         for i, sub in enumerate(subtitles_info):
@@ -351,39 +294,36 @@ def generate_hls_master(slice_result: dict, output_dir: Path, print_fn=None, sub
     ]
     if frame_rate > 0:
         stream_attrs.append(f"FRAME-RATE={frame_rate:.3f}".rstrip("0").rstrip("."))
-    stream_attrs.append('AUDIO="audio"')
     if subtitles_info:
         stream_attrs.append('SUBTITLES="subs"')
     lines.append(f"#EXT-X-STREAM-INF:{','.join(stream_attrs)}")
-    lines.append(slice_result.get("hlsVideo", "stream-v.m3u8"))
+    lines.append(slice_result.get("hlsVideo", "stream.m3u8"))
 
     content = "\n".join(lines) + "\n"
     master_path = output_dir / "master.m3u8"
     master_path.write_text(content, encoding="utf-8")
     sub_count = len(subtitles_info) if subtitles_info else 0
-    print_fn(f"   ✅ master.m3u8 已生成 ({len(audio_tracks)} 音轨, {sub_count} 字幕)")
+    print_fn(f"   ✅ master.m3u8 已生成 ({sub_count} 字幕)")
     return content
 
 
 # ─── DASH MPD 生成 ───
 
 def generate_dash_mpd(slice_result: dict, playlist_info: dict, output_dir: Path, print_fn=None) -> str:
-    """生成 DASH MPD (stream.mpd)，支持多音轨。使用 SegmentTemplate 模式（高效，文件小）。"""
+    """生成 DASH MPD (stream.mpd)，复合 fMP4 SegmentTemplate。"""
     if print_fn is None:
         print_fn = print
 
     video_segments = playlist_info["videoSegments"]
-    audio_tracks = slice_result.get("audioTracks", [])
-
     vcodec = slice_result["videoCodec"]
     acodec = slice_result["audioCodec"]
     bandwidth = slice_result["bandwidth"]
     width = slice_result["width"]
     height = slice_result["height"]
+    init_file = slice_result.get("audioInit", "init.mp4")
 
     total_duration = sum(seg["duration"] for seg in video_segments)
 
-    # ISO 8601 duration
     hours = int(total_duration // 3600)
     minutes = int((total_duration % 3600) // 60)
     seconds = total_duration % 60
@@ -395,42 +335,7 @@ def generate_dash_mpd(slice_result: dict, playlist_info: dict, output_dir: Path,
         duration_iso = f"PT{seconds:.3f}S"
 
     video_target_dur = playlist_info.get("videoTargetDuration", 6)
-    audio_target_dur = playlist_info.get("audioTargetDuration", 6)
-    audio_bandwidth = 192000
-
-    # 构建音频 AdaptationSet（使用 SegmentTemplate）
-    audio_adaptation_sets = ""
-    if not audio_tracks:
-        # 单音轨 fallback
-        audio_init = slice_result.get("audioInit", "init-a.mp4")
-        audio_suffix = audio_init.replace("init-", "").replace(".mp4", "")  # "a" 或 "a0"
-        audio_adaptation_sets = f'''    <AdaptationSet mimeType="audio/mp4" contentType="audio"
-                   segmentAlignment="true" startWithSAP="1" lang="und">
-      <Representation id="audio" bandwidth="{audio_bandwidth}" codecs="{acodec}"
-                      audioSamplingRate="48000">
-        <SegmentTemplate timescale="1" duration="{audio_target_dur}"
-                         initialization="{audio_init}"
-                         media="seg-{audio_suffix}-$Number%05d$.m4s"
-                         startNumber="0"/>
-      </Representation>
-    </AdaptationSet>'''
-    else:
-        for track in audio_tracks:
-            suffix = track["suffix"]
-            lang = track["lang"]
-            init_file = track["init"]
-            audio_adaptation_sets += f'''    <AdaptationSet mimeType="audio/mp4" contentType="audio"
-                   segmentAlignment="true" startWithSAP="1" lang="{lang}">
-      <Representation id="audio-{suffix}" bandwidth="{audio_bandwidth}" codecs="{acodec}"
-                      audioSamplingRate="48000">
-        <SegmentTemplate timescale="1" duration="{audio_target_dur}"
-                         initialization="{init_file}"
-                         media="seg-{suffix}-$Number%05d$.m4s"
-                         startNumber="0"/>
-      </Representation>
-    </AdaptationSet>
-'''
-
+    combined_codecs = f"{vcodec},{acodec}"
     mpd = f'''<?xml version="1.0" encoding="UTF-8"?>
 <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
      mediaPresentationDuration="{duration_iso}"
@@ -439,19 +344,18 @@ def generate_dash_mpd(slice_result: dict, playlist_info: dict, output_dir: Path,
   <Period>
     <AdaptationSet mimeType="video/mp4" contentType="video"
                    segmentAlignment="true" startWithSAP="1">
-      <Representation id="video" bandwidth="{bandwidth}"
-                      width="{width}" height="{height}" codecs="{vcodec}">
+      <Representation id="main" bandwidth="{bandwidth}"
+                      width="{width}" height="{height}" codecs="{combined_codecs}">
         <SegmentTemplate timescale="1" duration="{video_target_dur}"
-                         initialization="init-v.mp4"
-                         media="seg-v-$Number%05d$.m4s"
+                         initialization="{init_file}"
+                         media="seg-$Number$.m4s"
                          startNumber="0"/>
       </Representation>
     </AdaptationSet>
-{audio_adaptation_sets}  </Period>
+  </Period>
 </MPD>
 '''
-
     mpd_path = output_dir / "stream.mpd"
     mpd_path.write_text(mpd, encoding="utf-8")
-    print_fn(f"   ✅ stream.mpd 已生成 (duration: {duration_iso}, {len(audio_tracks) or 1} 音轨)")
+    print_fn(f"   ✅ stream.mpd 已生成 (duration: {duration_iso})")
     return mpd

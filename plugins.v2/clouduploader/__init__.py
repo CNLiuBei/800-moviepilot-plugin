@@ -41,9 +41,9 @@ def _episode_label(season, episode) -> str:
 class CloudUploader(_PluginBase):
     # ─── 插件元信息 ───
     plugin_name = "云端自动上传"
-    plugin_desc = "整理完成后自动 Apple HLS 切片→上传R2→入库到流媒体站，全流程在插件内完成。"
+    plugin_desc = "整理完成后自动 FFmpeg HLS 切片→上传R2→入库到流媒体站，全流程在插件内完成。"
     plugin_icon = "upload.png"
-    plugin_version = "2.6.0"
+    plugin_version = "2.8.0"
     plugin_author = "cn"
     author_url = "https://github.com/CNLiuBei/800-moviepilot-plugin"
     plugin_config_prefix = "clouduploader_"
@@ -167,9 +167,6 @@ class CloudUploader(_PluginBase):
             upload_concurrency=config.get("concurrency") or 8,
             ffmpeg_bin=config.get("ffmpeg_bin") or "ffmpeg",
             ffprobe_bin=config.get("ffprobe_bin") or "ffprobe",
-            mediafilesegmenter_bin=config.get("mediafilesegmenter_bin") or "mediafilesegmenter",
-            mediasubtitlesegmenter_bin=config.get("mediasubtitlesegmenter_bin") or "mediasubtitlesegmenter",
-            variantplaylistcreator_bin=config.get("variantplaylistcreator_bin") or "variantplaylistcreator",
             mediastreamvalidator_bin=config.get("mediastreamvalidator_bin") or "mediastreamvalidator",
             tg_bot_token=config.get("tg_bot_token", ""),
             tg_chat_id=config.get("tg_chat_id", ""),
@@ -1087,8 +1084,7 @@ class CloudUploader(_PluginBase):
                     # 二进制路径
                     _row(_text("ffmpeg_bin", "ffmpeg 路径", "ffmpeg", md=6),
                          _text("ffprobe_bin", "ffprobe 路径", "ffprobe", md=6)),
-                    _row(_text("mediafilesegmenter_bin", "Apple mediafilesegmenter 路径", "mediafilesegmenter", md=6),
-                         _text("mediastreamvalidator_bin", "Apple mediastreamvalidator 路径", "mediastreamvalidator", md=6)),
+                    _row(_text("mediastreamvalidator_bin", "Apple mediastreamvalidator 路径（可选校验）", "mediastreamvalidator", md=12)),
                     # Telegram (可选)
                     _row(_text("tg_bot_token", "Telegram Bot Token (可选)", md=6, ptype="password"),
                          _text("tg_chat_id", "Telegram Chat ID (可选)", md=6)),
@@ -1099,10 +1095,10 @@ class CloudUploader(_PluginBase):
                             "props": {
                                 "type": "info", "variant": "tonal",
                                 "text": ("整理完成后，插件等待指定延迟确认文件存在，"
-                                         "再在后台队列内依次完成 Apple HLS 切片→R2上传→站点入库。\n"
+                                         "再在后台队列内依次完成 FFmpeg HLS 切片→R2上传→站点入库。\n"
                                          "R2 配置：填一个 Cloudflare R2 API Token 即可自动获取账户ID/密钥/桶，无需手填。\n"
                                          "TMDB：留空自动用 MoviePilot 自带；直连失败时走 tmdb.liubei.org 中继（代连 TMDB 官方，不读站点库）。\n"
-                                         "切片器：视频 copy；杜比/AC3/FLAC 音轨自动转 AAC（Chrome 可播）；保留全部音轨（TMDB 原声默认）；Apple HLS Tools 校验。\n"
+                                         "切片：FFmpeg fMP4 HLS（视频 copy + 默认音轨杜比转 AAC）；mediastreamvalidator 可选校验。\n"
                                          "字幕：优先提取内嵌字幕；内嵌无中文时自动读取同目录同名/同季集 .ass/.srt 外挂字幕（内嵌与外挂均有中文时仅用内嵌）。\n"
                                          "因此通常只需填：CF API Token + 流媒体站地址 + 站点认证。"),
                             },
@@ -1122,9 +1118,6 @@ class CloudUploader(_PluginBase):
             "api_username": "", "api_password": "", "tmdb_token": "",
             "tmdb_proxy_base": "", "tmdb_image_proxy_base": "",
             "ffmpeg_bin": "ffmpeg", "ffprobe_bin": "ffprobe",
-            "mediafilesegmenter_bin": "mediafilesegmenter",
-            "mediasubtitlesegmenter_bin": "mediasubtitlesegmenter",
-            "variantplaylistcreator_bin": "variantplaylistcreator",
             "mediastreamvalidator_bin": "mediastreamvalidator",
             "tg_bot_token": "", "tg_chat_id": "",
         }
@@ -1134,14 +1127,16 @@ class CloudUploader(_PluginBase):
         env = self._env_status or {}
         has_ffmpeg = bool(env.get("ffmpeg")) if env else bool(shutil.which(settings.FFMPEG_BIN))
         has_ffprobe = bool(env.get("ffprobe")) if env else bool(shutil.which(settings.FFPROBE_BIN))
-        has_apple_hls = bool(env.get("apple_hls")) if env else bool(shutil.which(settings.MEDIAFILESEGMENTER_BIN) and shutil.which(settings.MEDIASTREAMVALIDATOR_BIN))
+        has_validator = bool(env.get("mediastreamvalidator")) if env else bool(shutil.which(settings.MEDIASTREAMVALIDATOR_BIN))
         missing = settings.validate()
 
         env_lines = []
         env_lines.append(f"FFmpeg: {'✅ ' + settings.FFMPEG_BIN if has_ffmpeg else '❌ 未找到（将尝试自动安装）'}")
         env_lines.append(f"FFprobe: {'✅ ' + settings.FFPROBE_BIN if has_ffprobe else '❌ 未找到'}")
-        env_lines.append(f"Apple HLS Tools: {'✅ ' + settings.MEDIAFILESEGMENTER_BIN if has_apple_hls else '❌ 未完整安装（任务会失败）'}")
-        env_lines.append("切片器: Apple HLS Tools（无备用切片器）")
+        env_lines.append(f"切片器: FFmpeg fMP4 HLS")
+        env_lines.append(
+            f"mediastreamvalidator: {'✅ ' + settings.MEDIASTREAMVALIDATOR_BIN if has_validator else '⚠️ 未安装（跳过校验）'}"
+        )
         if missing:
             env_lines.append("⚠️ 配置缺失: " + "、".join(missing))
         else:
