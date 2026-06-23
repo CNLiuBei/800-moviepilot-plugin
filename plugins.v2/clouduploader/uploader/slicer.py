@@ -2,7 +2,7 @@
 Apple HLS / CMAF 切片模块（插件内嵌版）。
 
 FFmpeg/ffprobe 用于探测与 stream copy 拆轨；mediafilesegmenter 以 CMAF fMP4 切片。
-全程不转码：H.264/HEVC 视频与 Apple HLS 支持的音轨（AAC/AC-3/E-AC-3/FLAC/ALAC）均 stream copy。
+视频 H.264/HEVC stream copy；音轨 AAC 可 copy，杜比/FLAC 等转 AAC 以兼容 Chrome/Firefox。
 """
 import json
 import math
@@ -18,6 +18,12 @@ _COPYABLE_VIDEO_CODECS = frozenset({"h264", "hevc", "h265"})
 # Apple HLS fMP4 可直接封装、无需转码的音轨编码（见 HLS Authoring Specification）
 _COPYABLE_AUDIO_CODECS = frozenset({
     "aac", "mp4a",
+    "ac3", "ac-3",
+    "eac3", "eac-3", "ec-3",
+    "flac", "alac",
+})
+# Chrome/Firefox MSE 仅稳定解码 AAC；杜比等须转码（Safari 原生 HLS 可播杜比）
+_TRANSCODE_TO_AAC_AUDIO_CODECS = frozenset({
     "ac3", "ac-3",
     "eac3", "eac-3", "ec-3",
     "flac", "alac",
@@ -292,6 +298,15 @@ def _audio_codec_string(codec: str) -> str:
     return "mp4a.40.2"
 
 
+def _should_transcode_audio_to_aac(codec: str) -> bool:
+    normalized = (codec or "").strip().lower()
+    if normalized in {"aac", "mp4a"}:
+        return False
+    if normalized in _TRANSCODE_TO_AAC_AUDIO_CODECS:
+        return True
+    return not _is_copyable_audio_codec(normalized)
+
+
 def _is_copyable_audio_codec(codec: str) -> bool:
     return (codec or "").strip().lower() in _COPYABLE_AUDIO_CODECS
 
@@ -323,13 +338,13 @@ def _prepare_audio_mezzanine(
     track: dict,
     print_fn,
 ) -> bool:
-    """音轨：Apple HLS 支持的编码 stream copy；不支持的才转 AAC。"""
+    """音轨：AAC stream copy；杜比/FLAC 等转 AAC 以兼容 Chrome/Firefox MSE。"""
     stream_map = f"0:a:{track['audio_index']}"
     codec = (track.get("codec") or "").lower()
     label = track.get("title") or track.get("lang") or "音轨"
     channels = int(track.get("channels") or 2)
 
-    if _is_copyable_audio_codec(codec):
+    if not _should_transcode_audio_to_aac(codec):
         codec_label = _audio_codec_string(codec)
         ch_info = f" / {channels}ch" if channels > 2 else ""
         print_fn(f"      [{track['lang']}] {label}: {codec} copy ({codec_label}{ch_info})")
@@ -542,7 +557,13 @@ def apple_hls_slice(
                 print_fn(f"   ❌ 音轨 [{track['lang']}] CMAF 播放清单整理失败")
                 return None
 
-            codec_str = _audio_codec_string(track.get("codec") or "")
+            source_codec = track.get("codec") or ""
+            transcoded = _should_transcode_audio_to_aac(source_codec)
+            codec_str = "mp4a.40.2" if transcoded else _audio_codec_string(source_codec)
+            manifest_channels = (
+                min(int(track.get("channels") or 2), settings.CMAF_AUDIO_CHANNELS)
+                if transcoded else int(track.get("channels") or 2)
+            )
             if track.get("is_default"):
                 default_playlist = audio_playlist
                 default_codec_str = codec_str
@@ -552,7 +573,7 @@ def apple_hls_slice(
                 "lang": track["lang"],
                 "title": track["title"],
                 "m3u8": f"stream-{suffix}.m3u8",
-                "channels": track["channels"],
+                "channels": manifest_channels,
                 "suffix": suffix,
                 "init": f"init-{suffix}.mp4",
                 "audioCodec": codec_str,

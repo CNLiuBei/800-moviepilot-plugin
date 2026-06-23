@@ -1,9 +1,9 @@
 {
   "CloudUploader": {
     "name": "云端自动上传",
-    "description": "整理完成/目录监控后自动 CMAF fMP4 音画分离切片（stream copy）→R2上传→入库。符合 Apple HLS Authoring 结构，TMDB元数据预检、任务去重、失败重试+对账兜底。",
+    "description": "整理完成/目录监控后自动 CMAF fMP4 音画分离切片→R2上传→入库。视频 copy；杜比/FLAC 音轨转 AAC 以兼容 Chrome；保留多音轨（TMDB 原声默认）；Apple HLS Tools 校验。",
     "labels": "上传,R2,CMAF,自动化",
-    "version": "2.5.7",
+    "version": "2.6.0",
     "icon": "https://raw.githubusercontent.com/CNLiuBei/800-moviepilot-plugin/main/icons/upload.png",
     "author": "cn",
     "level": 1,

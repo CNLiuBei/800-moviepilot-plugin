@@ -124,6 +124,9 @@ _LOW_PRIORITY_LABEL_HINTS = (
     "commentary", "评论", "評論", "forced", "强制", "強制",
 )
 
+_EXTERNAL_SUB_EXTS = frozenset({".ass", ".srt", ".ssa", ".sub", ".vtt"})
+_CHINESE_SUB_CATEGORIES = frozenset({"zh-Hans", "zh-Hant"})
+
 
 def _bcp47_language(lang: str) -> str:
     normalized = (lang or "und").strip().replace("_", "-")
@@ -547,6 +550,233 @@ def generate_hls_subtitle_playlists(
     if subtitle_tracks:
         print_fn(f"   ✅ HLS 字幕轨已生成: {len(subtitle_tracks)} 条")
     return subtitle_tracks
+
+
+def _has_chinese_subtitle(subtitles: list[dict]) -> bool:
+    return any(sub.get("category") in _CHINESE_SUB_CATEGORIES for sub in subtitles)
+
+
+def _external_file_score(path: Path) -> tuple[int, int, int]:
+    """外挂字幕候选优先级（值越小越优先）。"""
+    name = path.name.lower()
+    ext_rank = {
+        ".ass": 0, ".srt": 1, ".ssa": 2, ".vtt": 3, ".sub": 4,
+    }.get(path.suffix.lower(), 9)
+    hint_bonus = 0
+    if any(hint in name for hint in _ZH_HANS_LABEL_HINTS):
+        hint_bonus -= 3
+    if any(hint in name for hint in _ZH_HANT_LABEL_HINTS):
+        hint_bonus -= 2
+    if any(hint in name for hint in _EN_LABEL_HINTS):
+        hint_bonus += 1
+    return (hint_bonus, ext_rank, len(name))
+
+
+def _infer_external_lang_label(path: Path) -> tuple[str, str]:
+    """从外挂字幕文件名推断语言与展示名。"""
+    stem = path.stem
+    tokens = re.split(r"[.\-_+\s]+", stem.lower())
+    lang = "und"
+    for token in tokens:
+        if token in _ZH_HANT_LANGS or token in {"cht", "tc", "big5", "traditional"}:
+            lang = "zht"
+            break
+        if token in _ZH_HANS_LANGS or token in {"chs", "sc", "gb", "simplified", "cn"}:
+            lang = "chi"
+            break
+        if token in _EN_LANGS:
+            lang = "eng"
+            break
+        if token in {"jpn", "jp", "ja"}:
+            lang = "jpn"
+            break
+        if token in {"kor", "ko", "kr"}:
+            lang = "kor"
+            break
+    label = stem
+    if lang == "chi":
+        label = "简体中文 (外挂)"
+    elif lang == "zht":
+        label = "繁体中文 (外挂)"
+    elif lang == "und":
+        label = "外挂字幕"
+    else:
+        label = f"{_LANG_LABELS.get(lang, lang)} (外挂)"
+    return lang, label
+
+
+def _external_subtitle_metadata(
+    path: Path,
+    video_path: Path,
+    original_language: str | None = None,
+) -> dict | None:
+    lang, label = _infer_external_lang_label(path)
+    category = _subtitle_category(lang, label, original_language)
+    if not category and path.stem == video_path.stem:
+        # 与视频同名的 .ass/.srt 在中文剧集场景下默认按简体中文字幕处理
+        category = "zh-Hans"
+        lang = "chi"
+        if label == "外挂字幕":
+            label = "简体中文 (外挂)"
+    if not category:
+        return None
+    return {
+        "lang": lang,
+        "label": label,
+        "category": category,
+        "source_path": str(path),
+    }
+
+
+def find_external_subtitle_files(video_path: str) -> list[Path]:
+    """查找与视频同目录下的外挂字幕（同名或同季集标识）。"""
+    video = Path(video_path)
+    parent = video.parent
+    if not parent.is_dir():
+        return []
+
+    stem = video.stem
+    seen: set[str] = set()
+    found: list[Path] = []
+
+    def _add(candidate: Path):
+        resolved = str(candidate.resolve())
+        if resolved in seen or not candidate.is_file():
+            return
+        seen.add(resolved)
+        found.append(candidate)
+
+    for ext in _EXTERNAL_SUB_EXTS:
+        _add(parent / f"{stem}{ext}")
+
+    episode_match = re.search(r"[sS](\d+)[eE](\d+)", stem)
+    if episode_match:
+        season, episode = episode_match.groups()
+        episode_pattern = re.compile(rf"[sS]0*{season}[eE]0*{episode}", re.IGNORECASE)
+        for child in parent.iterdir():
+            if child.suffix.lower() not in _EXTERNAL_SUB_EXTS:
+                continue
+            if child.stem == stem:
+                continue
+            if episode_pattern.search(child.stem):
+                _add(child)
+
+    found.sort(key=_external_file_score)
+    return found
+
+
+def _convert_subtitle_file_to_vtt(src: Path, dest: Path) -> bool:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        settings.FFMPEG_BIN, "-y",
+        "-i", str(src),
+        "-c:s", "webvtt",
+        str(dest),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and dest.is_file() and dest.stat().st_size > 10
+
+
+def _load_external_subtitles(
+    video_path: str,
+    output_dir: Path,
+    print_fn=print,
+    original_language: str | None = None,
+) -> list[dict]:
+    video = Path(video_path)
+    files = find_external_subtitle_files(video_path)
+    if not files:
+        return []
+
+    best_by_category: dict[str, tuple[tuple[int, int, int], Path, dict]] = {}
+    for src in files:
+        meta = _external_subtitle_metadata(src, video, original_language)
+        if not meta:
+            continue
+        category = meta["category"]
+        score = _external_file_score(src)
+        prev = best_by_category.get(category)
+        if prev and prev[0] <= score:
+            continue
+        best_by_category[category] = (score, src, meta)
+
+    converted: list[dict] = []
+    for category in _SUBTITLE_CATEGORY_ORDER:
+        entry = best_by_category.get(category)
+        if not entry:
+            continue
+        _, src, meta = entry
+        index = len(converted)
+        safe_lang = re.sub(r"[^A-Za-z0-9_-]+", "-", meta["lang"]).strip("-") or "und"
+        out_file = f"sub-ext-{index}-{safe_lang}.vtt"
+        out_path = output_dir / out_file
+        if not _convert_subtitle_file_to_vtt(src, out_path):
+            print_fn(f"   ⚠️ 外挂字幕转换失败: {src.name}")
+            continue
+        converted.append({
+            "lang": meta["lang"],
+            "label": meta["label"],
+            "file": out_file,
+            "category": meta["category"],
+            "source": "external",
+        })
+        print_fn(f"   外挂字幕 [{meta['lang']}] {meta['label']}: {src.name} → {out_file}")
+
+    if converted:
+        kept = "、".join(
+            f"{_SUBTITLE_CATEGORY_LABELS[item['category']]}[{item['lang']}]"
+            for item in converted
+        )
+        print_fn(f"   选用外挂字幕: {kept}")
+    return converted
+
+
+def resolve_subtitles_for_upload(
+    input_path: str,
+    output_dir: Path,
+    print_fn=None,
+    original_language: str | None = None,
+) -> list[dict]:
+    """
+    解析上传任务字幕：优先内嵌；内嵌无中文时回退同目录外挂字幕。
+    若内嵌与外挂均含中文，仅保留内嵌（取其一，避免重复轨）。
+    """
+    if print_fn is None:
+        print_fn = print
+
+    embedded = extract_subtitles(
+        input_path,
+        output_dir,
+        print_fn=print_fn,
+        original_language=original_language,
+    )
+    if _has_chinese_subtitle(embedded):
+        print_fn("   内嵌字幕已含中文，使用内嵌字幕")
+        return embedded
+
+    external = _load_external_subtitles(
+        input_path,
+        output_dir,
+        print_fn=print_fn,
+        original_language=original_language,
+    )
+    if not external:
+        return embedded
+
+    if not embedded:
+        return external
+
+    merged = list(embedded)
+    existing_categories = {sub.get("category") for sub in merged}
+    for sub in external:
+        category = sub.get("category")
+        if category in _CHINESE_SUB_CATEGORIES and category not in existing_categories:
+            merged.append(sub)
+            existing_categories.add(category)
+    return merged
 
 
 def extract_subtitles(

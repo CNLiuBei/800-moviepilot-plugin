@@ -14,7 +14,61 @@ class HLSValidationError(Exception):
     pass
 
 
-def validate_hls_media_playlist(playlist_path: Path, track_type: str) -> list[dict]:
+def repair_hls_target_duration(playlist_path: Path, print_fn=None) -> bool:
+    """
+    修正 #EXT-X-TARGETDURATION，使其不小于所有 #EXTINF 时长的向上取整。
+    mediafilesegmenter 偶发写出偏小的 TARGETDURATION（如 6 vs 6.465s）。
+    返回 True 表示已改写文件。
+    """
+    if not playlist_path.exists():
+        return False
+
+    lines = playlist_path.read_text(encoding="utf-8").splitlines()
+    target_idx = None
+    target_duration = None
+    max_seg_dur = 0.0
+
+    for index, line in enumerate(lines):
+        line_s = line.strip()
+        if line_s.startswith("#EXT-X-TARGETDURATION:"):
+            target_idx = index
+            try:
+                target_duration = int(line_s.split(":")[1])
+            except (ValueError, IndexError):
+                target_duration = None
+        elif line_s.startswith("#EXTINF:"):
+            dur_str = line_s[len("#EXTINF:"):].rstrip(",").strip()
+            try:
+                max_seg_dur = max(max_seg_dur, float(dur_str))
+            except ValueError:
+                continue
+
+    if max_seg_dur <= 0:
+        return False
+
+    required = max(1, math.ceil(max_seg_dur))
+    if target_duration is not None and target_duration >= required:
+        return False
+
+    if print_fn:
+        old = target_duration if target_duration is not None else "缺失"
+        print_fn(
+            f"   🔧 修正 {playlist_path.name} #EXT-X-TARGETDURATION: "
+            f"{old} → {required} (最大片段 {max_seg_dur:.3f}s)"
+        )
+
+    new_line = f"#EXT-X-TARGETDURATION:{required}"
+    if target_idx is not None:
+        lines[target_idx] = new_line
+    else:
+        insert_at = 1 if lines and lines[0].strip() == "#EXTM3U" else 0
+        lines.insert(insert_at, new_line)
+
+    playlist_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return True
+
+
+def validate_hls_media_playlist(playlist_path: Path, track_type: str, print_fn=None) -> list[dict]:
     """
     验证 FFmpeg 生成的 HLS Media Playlist 的完整性。
 
@@ -30,6 +84,9 @@ def validate_hls_media_playlist(playlist_path: Path, track_type: str) -> list[di
     """
     if not playlist_path.exists():
         raise HLSValidationError(f"播放列表文件不存在: {playlist_path}")
+
+    if repair_hls_target_duration(playlist_path, print_fn=print_fn):
+        pass  # 已自动修正 TARGETDURATION，继续校验
 
     content = playlist_path.read_text(encoding="utf-8")
     lines = content.strip().splitlines()
@@ -157,7 +214,7 @@ def validate_hls_media_playlists(output_dir: Path, print_fn=None) -> dict:
     video_playlist = output_dir / "stream-v.m3u8"
 
     print_fn("   🔍 验证 stream-v.m3u8...")
-    video_segments = validate_hls_media_playlist(video_playlist, "video")
+    video_segments = validate_hls_media_playlist(video_playlist, "video", print_fn=print_fn)
     print_fn(f"   ✅ stream-v.m3u8: {len(video_segments)} 片段, "
              f"总时长 {sum(s['duration'] for s in video_segments):.2f}s")
 
@@ -169,7 +226,7 @@ def validate_hls_media_playlists(output_dir: Path, print_fn=None) -> dict:
     audio_target_duration = 0
     for audio_playlist in audio_playlists:
         print_fn(f"   🔍 验证 {audio_playlist.name}...")
-        segments = validate_hls_media_playlist(audio_playlist, "audio")
+        segments = validate_hls_media_playlist(audio_playlist, "audio", print_fn=print_fn)
         if not audio_segments:
             audio_segments = segments
         audio_target_duration = max(audio_target_duration, _extract_target_duration(audio_playlist))

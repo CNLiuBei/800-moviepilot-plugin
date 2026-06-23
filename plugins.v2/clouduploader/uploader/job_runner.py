@@ -22,7 +22,7 @@ from urllib.parse import unquote, urlparse
 from .runtime_config import settings
 from .parser import parse_filename
 from .slicer import apple_hls_slice, get_video_duration
-from .subtitles import extract_subtitles, generate_hls_subtitle_playlists
+from .subtitles import resolve_subtitles_for_upload, generate_hls_subtitle_playlists
 from .tmdb import get_original_language, verify_tmdb_metadata
 from .register import auto_register, write_episode_nfo, write_show_nfo
 from .notify import notify_upload_success, notify_upload_failed
@@ -550,7 +550,7 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
                 return {"status": "cancelled", "error": None, "r2_path": r2_path}
             log("📝 提取字幕...")
             local_output.mkdir(parents=True, exist_ok=True)
-            subtitles = extract_subtitles(
+            subtitles = resolve_subtitles_for_upload(
                 filepath,
                 local_output,
                 print_fn=log,
@@ -558,9 +558,10 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
             )
             if subtitles:
                 for sub in subtitles:
-                    log(f"   字幕 [{sub['lang']}] {sub['label']}")
+                    source = "外挂" if sub.get("source") == "external" else "内嵌"
+                    log(f"   字幕 [{sub['lang']}] {sub['label']} ({source})")
             else:
-                log("   无内嵌字幕")
+                log("   无内嵌/外挂字幕")
 
         # ─── 切片 ───
         if not params.get("skip_slice") and not remote_uploaded:

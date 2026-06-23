@@ -183,8 +183,12 @@ def auto_configure(token_value: str, prefer_bucket: str = "", create_if_missing:
 
     access_key_id = verify_token(token_value, log=log)
     if not access_key_id:
-        log("   ❌ CF Token 校验失败：请使用「User API Token」(cfut_ 开头)，")
-        log("      在 https://dash.cloudflare.com/profile/api-tokens 创建，赋予 R2 读写权限；")
+        # verify_token 会把最后一次错误打在日志里；这里按错误类型给可操作提示
+        log("   ❌ CF Token 自动配置未完成。")
+        log("      若日志含 ConnectError / nodename nor servname：MoviePilot 无法解析 api.cloudflare.com，")
+        log("      请检查容器/主机的 DNS、代理或网络；可改用手动填写 R2 账户 ID + Access Key + Secret Key。")
+        log("      若网络正常：请使用「User API Token」(cfut_ 开头)，在")
+        log("      https://dash.cloudflare.com/profile/api-tokens 创建并赋予 R2 读写权限；")
         log("      R2 后台生成的 cfat_ 令牌不适用于自动配置。")
         return None
     log("   ✅ CF Token 有效")

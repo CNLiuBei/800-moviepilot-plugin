@@ -43,7 +43,7 @@ class CloudUploader(_PluginBase):
     plugin_name = "云端自动上传"
     plugin_desc = "整理完成后自动 Apple HLS 切片→上传R2→入库到流媒体站，全流程在插件内完成。"
     plugin_icon = "upload.png"
-    plugin_version = "2.5.7"
+    plugin_version = "2.6.0"
     plugin_author = "cn"
     author_url = "https://github.com/CNLiuBei/800-moviepilot-plugin"
     plugin_config_prefix = "clouduploader_"
@@ -109,14 +109,15 @@ class CloudUploader(_PluginBase):
         if not tmdb_token:
             tmdb_token = getattr(mp_settings, "TMDB_API_KEY", "") or ""
 
-        # ── R2 配置：优先用 CF API Token 自动推导，否则用手填字段 ──
-        r2_account_id = config.get("r2_account_id", "")
-        r2_access_key_id = config.get("r2_access_key_id", "")
-        r2_secret_access_key = config.get("r2_secret_access_key", "")
+        # ── R2 配置：手填完整时优先用手填；否则尝试 CF API Token 自动推导 ──
+        r2_account_id = (config.get("r2_account_id") or "").strip()
+        r2_access_key_id = (config.get("r2_access_key_id") or "").strip()
+        r2_secret_access_key = (config.get("r2_secret_access_key") or "").strip()
         r2_bucket = config.get("r2_bucket") or "flix-800-assets"
+        manual_r2_ready = bool(r2_account_id and r2_access_key_id and r2_secret_access_key)
 
         cf_token = (config.get("cf_api_token") or "").strip()
-        if cf_token:
+        if cf_token and not manual_r2_ready:
             try:
                 derived = _cf_auto.auto_configure(
                     cf_token,
@@ -132,9 +133,15 @@ class CloudUploader(_PluginBase):
                         r2_bucket = derived["bucket"]
                     self._cf_derived = derived
                 else:
-                    logger.warning("[CloudUploader] CF Token 自动配置失败，回退手填 R2 配置")
+                    logger.warning(
+                        "[CloudUploader] CF Token 自动配置失败，回退手填 R2 配置。"
+                        "若日志含 nodename/ConnectError，说明无法访问 api.cloudflare.com，"
+                        "请在下方手动填写 R2 账户 ID、Access Key、Secret Key 后保存。"
+                    )
             except Exception as e:
                 logger.error(f"[CloudUploader] CF 自动配置异常: {e}")
+        elif cf_token and manual_r2_ready:
+            logger.info("[CloudUploader] 已检测到完整的手动 R2 配置，跳过 CF Token 自动推导")
 
         # 注入业务配置到 runtime settings
         hls_dir = self.get_data_path() / "hls-output"
@@ -1095,7 +1102,8 @@ class CloudUploader(_PluginBase):
                                          "再在后台队列内依次完成 Apple HLS 切片→R2上传→站点入库。\n"
                                          "R2 配置：填一个 Cloudflare R2 API Token 即可自动获取账户ID/密钥/桶，无需手填。\n"
                                          "TMDB：留空自动用 MoviePilot 自带；直连失败时走 tmdb.liubei.org 中继（代连 TMDB 官方，不读站点库）。\n"
-                                         "切片器：视频/音轨 Apple 支持编码均 copy；保留全部音轨（TMDB 原声默认）；Apple HLS Tools 校验。\n"
+                                         "切片器：视频 copy；杜比/AC3/FLAC 音轨自动转 AAC（Chrome 可播）；保留全部音轨（TMDB 原声默认）；Apple HLS Tools 校验。\n"
+                                         "字幕：优先提取内嵌字幕；内嵌无中文时自动读取同目录同名/同季集 .ass/.srt 外挂字幕（内嵌与外挂均有中文时仅用内嵌）。\n"
                                          "因此通常只需填：CF API Token + 流媒体站地址 + 站点认证。"),
                             },
                         }],
