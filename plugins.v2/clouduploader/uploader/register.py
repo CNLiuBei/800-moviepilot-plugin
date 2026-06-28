@@ -389,6 +389,7 @@ def _do_register(
         print_fn(f"   ✅ 字幕清单: {len(sub_manifest)} 条")
 
     print_fn("   ✅ 入库完成!")
+    print_fn("   📣 站点已配置 Telegram 上新通知时，首次绑定播放源后将自动推送到频道")
     return True, ""
 
 

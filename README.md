@@ -12,6 +12,7 @@ MoviePilot 插件仓库。
 - `ffmpeg`/`ffprobe` 用于源文件探测和中间 MP4 准备，优先用系统自带、缺失回退 pip（`static-ffmpeg`）；Apple 官方 HLS Tools 需从 Apple Developer 下载并手动安装
 - 配置全部在插件界面填写（R2 / TMDB / 站点凭证），无需 `.env`
 - 详情页显示环境检测与任务队列状态
+- 站点 Admin 配置 Telegram 上新通知后，插件上传入库（首次绑定播放源）会自动推送到频道 [@TVBot800](https://t.me/TVBot800)
 
 ## 在 MoviePilot 中安装
 
