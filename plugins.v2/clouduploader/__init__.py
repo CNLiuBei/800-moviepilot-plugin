@@ -28,6 +28,7 @@ from .uploader.job_runner import run_job
 from .uploader import notify as _notify_mod
 from .uploader import env as _env
 from .uploader import cf_auto as _cf_auto
+from .uploader import connect_config as _connect_config
 
 
 def _has_episode_numbers(season, episode) -> bool:
@@ -43,7 +44,7 @@ class CloudUploader(_PluginBase):
     plugin_name = "云端自动上传"
     plugin_desc = "整理完成后自动 FFmpeg HLS 切片→上传R2→入库到流媒体站，全流程在插件内完成。"
     plugin_icon = "upload.png"
-    plugin_version = "2.8.4"
+    plugin_version = "2.8.5"
     plugin_author = "cn"
     author_url = "https://github.com/CNLiuBei/800-moviepilot-plugin"
     plugin_config_prefix = "clouduploader_"
@@ -94,6 +95,11 @@ class CloudUploader(_PluginBase):
     def init_plugin(self, config: dict = None):
         """读取配置并初始化任务队列。"""
         config = config or {}
+        config = _connect_config.merge_connect_paste(config)
+        if config.get("connect_paste"):
+            parsed = _connect_config.parse_connect_paste(config.get("connect_paste"))
+            if parsed.get("api_base") or parsed.get("api_admin_key"):
+                logger.info("[CloudUploader] 已从对接配置粘贴解析站点/Key")
         self._config = config
         self._enabled = bool(config.get("enabled"))
         self._notify = bool(config.get("notify", True))
@@ -1119,6 +1125,10 @@ class CloudUploader(_PluginBase):
                     _advanced_row(_text("scan_interval", "定时扫描(分，0=禁用)", "0", md=4, ptype="number"),
                                   _textarea("watch_dirs", "监控目录（一行一个，留空=媒体库）",
                                             "/media/library", md=8)),
+                    _advanced_row(_textarea("connect_paste",
+                                            "对接配置粘贴（从 Admin 集成页一键复制）",
+                                            "api_base=https://你的域名.com\napi_admin_key=gyadmin_...",
+                                            md=12)),
                     _advanced_row(_text("r2_account_id", "R2 账户 ID（手动）", md=4),
                                   _text("r2_access_key_id", "R2 Access Key（手动）", md=4),
                                   _text("r2_secret_access_key", "R2 Secret Key（手动）", md=4, ptype="password")),
@@ -1148,6 +1158,7 @@ class CloudUploader(_PluginBase):
             "delay": 30, "segment_seconds": 6, "concurrency": 8, "reconcile_interval": 30,
             "scan_interval": 0, "scan_on_start": True,
             "watch_enabled": True, "watch_delay": 20, "watch_dirs": "",
+            "connect_paste": "",
             "cf_api_token": "", "cf_create_bucket": False,
             "r2_account_id": "", "r2_bucket": "flix-800-assets",
             "r2_access_key_id": "", "r2_secret_access_key": "",
