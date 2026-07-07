@@ -477,6 +477,12 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
             log(f"❌ {msg}，已停止任务，避免切片后上传失败")
             return {"status": "error", "error": msg, "r2_path": None, "stage": "precheck"}
 
+        from .env import resolve_tool
+        if not resolve_tool(settings.FFMPEG_BIN) or not resolve_tool(settings.FFPROBE_BIN):
+            msg = "切片环境未就绪: 未找到 ffmpeg/ffprobe"
+            log(f"❌ {msg}")
+            return {"status": "error", "error": msg, "r2_path": None, "stage": "precheck"}
+
         filepath = params["filepath"]
         if not os.path.isfile(filepath):
             log(f"❌ 文件不存在: {filepath}")

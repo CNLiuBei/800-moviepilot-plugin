@@ -290,6 +290,45 @@ def format_env_header(env: dict) -> str:
     return f"平台: {env.get('platform', '?')} | 切片环境 {ready}"
 
 
+def apply_env_paths(env: dict) -> None:
+    """将探测结果回写到 settings。"""
+    if env.get("ffmpeg_path"):
+        settings.FFMPEG_BIN = env["ffmpeg_path"]
+    if env.get("ffprobe_path"):
+        settings.FFPROBE_BIN = env["ffprobe_path"]
+    if env.get("mediastreamvalidator_path"):
+        settings.MEDIASTREAMVALIDATOR_BIN = env["mediastreamvalidator_path"]
+    if env.get("packager_path"):
+        settings.PACKAGER_BIN = env["packager_path"]
+
+
+def format_setup_checklist(
+    missing: list[str],
+    env: dict,
+    *,
+    cf_auto: bool = False,
+    tmdb_auto: bool = False,
+) -> list[str]:
+    """详情页「无脑上手」检查清单。"""
+    lines = ["无脑上手：填 CF Token + 站点地址 + Admin Key → 保存 → 启用"]
+
+    def _line(label: str, ok: bool, hint: str = "") -> None:
+        icon = "✅" if ok else "❌"
+        extra = f" — {hint}" if hint and not ok else (" — 已自动配置" if ok and hint else "")
+        lines.append(f"{icon} {label}{extra}")
+
+    r2_missing = {"R2 账户 ID", "R2 Access Key", "R2 Secret Key", "R2 Bucket"}
+    r2_ok = not r2_missing.intersection(missing)
+    _line("R2 存储", r2_ok, "填 Cloudflare API Token（推荐）" if not cf_auto else "CF Token")
+    _line("流媒体站地址", "流媒体站地址" not in missing, "如 https://你的域名.com")
+    _line("站点 Admin Key", "站点认证（Admin Key 或 用户名+密码）" not in missing,
+          "Admin 集成页一键生成")
+    tmdb_ok = "TMDB Token" not in missing
+    _line("TMDB", tmdb_ok, "留空则用 MoviePilot 自带 Key" if tmdb_auto else "填写 Token 或配置 MP")
+    _line("切片环境 ffmpeg/ffprobe", bool(env.get("ready")), "保持「自动安装切片器」开启")
+    return lines
+
+
 # 兼容旧 import
 ensure_all = resolve_environment
 probe_binaries = probe_environment

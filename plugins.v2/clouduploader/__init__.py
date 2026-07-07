@@ -43,7 +43,7 @@ class CloudUploader(_PluginBase):
     plugin_name = "云端自动上传"
     plugin_desc = "整理完成后自动 FFmpeg HLS 切片→上传R2→入库到流媒体站，全流程在插件内完成。"
     plugin_icon = "upload.png"
-    plugin_version = "2.8.3"
+    plugin_version = "2.8.4"
     plugin_author = "cn"
     author_url = "https://github.com/CNLiuBei/800-moviepilot-plugin"
     plugin_config_prefix = "clouduploader_"
@@ -65,6 +65,8 @@ class CloudUploader(_PluginBase):
 
     # 二进制环境检测结果（由后台安装线程填充）
     _env_status: dict = {}
+    _env_lock = threading.Lock()
+    _env_resolve_running = False
     # CF Token 自动推导出的 R2 配置（供详情页展示）
     _cf_derived: dict = {}
 
@@ -186,15 +188,16 @@ class CloudUploader(_PluginBase):
             _notify_mod.set_mp_notifier(None)
 
         # 启动任务队列工作线程
-        if self._enabled and self._config_ready:
-            self._start_worker()
-            # 后台准备外部二进制（探测 ffmpeg/ffprobe），不阻塞插件加载
-            threading.Thread(target=self._prepare_env, daemon=True).start()
-            # 重启恢复：把上次未完成/失败的任务重新入队
-            threading.Thread(target=self._recover_tasks, daemon=True).start()
-            self._start_directory_watch()
-            if self._scan_on_start:
-                threading.Thread(target=self._scan_library_on_start, daemon=True).start()
+        if self._enabled:
+            if self._config_ready:
+                self._start_worker()
+                threading.Thread(target=self._prepare_env, daemon=True).start()
+                threading.Thread(target=self._recover_tasks, daemon=True).start()
+                self._start_directory_watch()
+                if self._scan_on_start:
+                    threading.Thread(target=self._scan_library_on_start, daemon=True).start()
+            else:
+                threading.Thread(target=self._prepare_env, daemon=True).start()
 
     # ─── 任务持久化（用插件 save_data，重启不丢、失败可对账重投）───
 
@@ -310,15 +313,41 @@ class CloudUploader(_PluginBase):
 
     def _prepare_env(self):
         """后台探测 ffmpeg/ffprobe（缺失时回退 pip 包）。"""
+        self._env_resolve_running = True
         try:
+            with self._env_lock:
+                self._env_status = _env.resolve_environment(
+                    log=lambda m: logger.info(f"[CloudUploader] {m}"),
+                    auto_install=self._auto_install,
+                )
+            logger.info(
+                f"[CloudUploader] 环境就绪: ffmpeg={self._env_status.get('ffmpeg')} "
+                f"ffprobe={self._env_status.get('ffprobe')}"
+            )
+        except Exception as e:
+            logger.error(f"[CloudUploader] 环境准备失败: {e}")
+        finally:
+            self._env_resolve_running = False
+
+    def _ensure_slice_env(self, force: bool = False) -> bool:
+        """任务入队前确保切片环境可用（必要时同步触发 auto-install）。"""
+        if self._env_status.get("ready") and not force:
+            return True
+        with self._env_lock:
+            if self._env_status.get("ready") and not force:
+                return True
             self._env_status = _env.resolve_environment(
                 log=lambda m: logger.info(f"[CloudUploader] {m}"),
                 auto_install=self._auto_install,
             )
-            logger.info(f"[CloudUploader] 环境就绪: ffmpeg={self._env_status.get('ffmpeg')} "
-                        f"ffprobe={self._env_status.get('ffprobe')}")
-        except Exception as e:
-            logger.error(f"[CloudUploader] 环境准备失败: {e}")
+        return bool(self._env_status.get("ready"))
+
+    def _kick_env_resolve(self):
+        """详情页/保存后：后台补跑环境安装，不阻塞 UI。"""
+        if self._env_status.get("ready") or self._env_resolve_running:
+            return
+        self._env_resolve_running = True
+        threading.Thread(target=self._prepare_env, daemon=True).start()
 
     # ─── 任务队列 ───
 
@@ -444,6 +473,12 @@ class CloudUploader(_PluginBase):
             if record:
                 self._record_task(key, params, "error", error=error, stage="precheck")
             return False
+        if not self._ensure_slice_env():
+            error = "切片环境未就绪: 未找到 ffmpeg/ffprobe，请开启自动安装或填写路径"
+            logger.warning(f"[CloudUploader] {error}，跳过入队: {key}")
+            if record:
+                self._record_task(key, params, "error", error=error, stage="precheck")
+            return False
         with self._inflight_lock:
             if key in self._inflight:
                 logger.info(f"[CloudUploader] 任务已在队列/执行中，跳过重复入队: {key}")
@@ -509,6 +544,13 @@ class CloudUploader(_PluginBase):
                 "summary": "立即执行上传对账",
                 "description": "后台重投仍可恢复的失败上传任务。",
             },
+            {
+                "path": "/refresh_env",
+                "endpoint": self.api_refresh_env,
+                "methods": ["POST"],
+                "summary": "重新检测切片环境",
+                "description": "重新探测 ffmpeg/ffprobe，必要时触发 static-ffmpeg 自动安装。",
+            },
         ]
 
     def api_scan_library(self) -> dict:
@@ -526,6 +568,11 @@ class CloudUploader(_PluginBase):
             return {"success": False, "message": "配置缺失: " + "、".join(settings.validate())}
         threading.Thread(target=self.reconcile, daemon=True).start()
         return {"success": True, "message": "已开始后台对账"}
+
+    def api_refresh_env(self) -> dict:
+        ready = self._ensure_slice_env(force=True)
+        msg = "切片环境已就绪" if ready else "仍未找到 ffmpeg/ffprobe，请检查日志或填写路径"
+        return {"success": ready, "ready": ready, "message": msg, "platform": self._env_status.get("platform")}
 
     def get_service(self) -> List[Dict[str, Any]]:
         """注册定时服务：对账兜底 + 媒体库目录扫描补传。"""
@@ -1032,86 +1079,75 @@ class CloudUploader(_PluginBase):
                                  "props": {"model": model, "label": label,
                                            "placeholder": placeholder, "rows": 2}}]}
 
+        def _advanced_row(*cols):
+            return {"component": "VRow", "props": {"v-show": "show_advanced"}, "content": list(cols)}
+
         return [
             {
                 "component": "VForm",
                 "content": [
+                    _row({"component": "VCol", "props": {"cols": 12},
+                          "content": [{"component": "VAlert", "props": {
+                              "type": "success", "variant": "tonal", "density": "compact",
+                              "text": ("无脑上手只需 3 项：① Cloudflare API Token  "
+                                       "② 流媒体站地址  ③ Admin API Key。"
+                                       "保存并启用后，整理完成会自动切片上传入库。"
+                                       "TMDB 留空即用 MoviePilot 自带 Key。"),
+                          }}]}),
                     _row(_switch("enabled", "启用插件", md=3),
+                         _switch("auto_install", "自动安装切片器", md=3),
                          _switch("notify", "发送通知", md=3),
-                         _switch("clean_after", "上传后清理源文件", md=3),
-                         _switch("auto_install", "自动安装切片器", md=3)),
-                    _row(_text("delay", "提交延迟(秒)", "30", md=3, ptype="number"),
-                         _text("segment_seconds", "切片时长(秒)", "6", md=3, ptype="number"),
-                         _text("concurrency", "上传并发数", "8", md=3, ptype="number"),
-                         _text("reconcile_interval", "对账间隔(分)", "30", md=3, ptype="number")),
-                    _row(_text("scan_interval", "目录扫描间隔(分，0=禁用)", "0", md=4, ptype="number"),
-                         _switch("scan_on_start", "启动后扫描一次", md=4),
-                         {"component": "VCol", "props": {"cols": 12, "md": 4},
-                          "content": [{"component": "VAlert", "props": {
-                              "type": "info", "variant": "tonal", "density": "compact",
-                              "text": "目录扫描：补传已在媒体库但未上传的文件。建议启用启动扫描，定时扫描可设为 120。"
-                          }}]}),
-                    _row(_switch("watch_enabled", "实时监控目录", md=3),
-                         _text("watch_delay", "监控延迟(秒)", "20", md=3, ptype="number"),
-                         {"component": "VCol", "props": {"cols": 12, "md": 6},
-                          "content": [{"component": "VAlert", "props": {
-                              "type": "info", "variant": "tonal", "density": "compact",
-                              "text": "实时监控：文件创建/移动后等待稳定，再按整理历史自动入队。监控目录留空时使用本地媒体库目录。"
-                          }}]}),
-                    _row(_textarea("watch_dirs", "监控目录（一行一个，留空=媒体库目录）",
-                                   "/media/library\n/mnt/downloads", md=12)),
-                    # R2：填一个 CF API Token 即可自动推导账户ID/密钥/桶（推荐）
+                         _switch("clean_after", "上传后清理源文件", md=3)),
                     _row({"component": "VCol", "props": {"cols": 12},
                           "content": [{"component": "VTextField",
                                        "props": {"model": "cf_api_token",
-                                                 "label": "Cloudflare User API Token（cfut_ 开头，填这个自动配置 R2，推荐）",
-                                                 "placeholder": "dash.cloudflare.com/profile/api-tokens 创建，赋予 R2 读写权限",
+                                                 "label": "① Cloudflare API Token（推荐，自动配置 R2）",
+                                                 "placeholder": "dash.cloudflare.com 创建，赋予 R2 读写权限",
                                                  "type": "password"}}]}),
-                    _row(_switch("cf_create_bucket", "桶不存在时自动创建", md=6),
-                         _text("r2_bucket", "R2 存储桶名", "flix-800-assets", md=6)),
-                    # R2 手动配置（不用 CF Token 时填）
-                    _row(_text("r2_account_id", "R2 账户 ID（手动配置时填）", md=6),
-                         _text("r2_access_key_id", "R2 Access Key（手动）", md=6)),
-                    _row(_text("r2_secret_access_key", "R2 Secret Key（手动）", md=12, ptype="password")),
-                    # 站点
-                    _row(_text("api_base", "流媒体站地址", "https://your-domain.example", md=6),
-                         _text("api_admin_key", "站点 Admin Key (优先)", md=6, ptype="password")),
-                    _row(_text("api_username", "站点用户名 (无 Admin Key 时)", md=6),
-                         _text("api_password", "站点密码", md=6, ptype="password")),
-                    # TMDB
-                    _row(_text("tmdb_token", "TMDB Token/API Key（留空则用 MoviePilot 自带）", md=12, ptype="password")),
-                    _row(_text("tmdb_proxy_base", "TMDB 元数据代理（留空默认 tmdb.liubei.org）", md=6),
-                         _text("tmdb_image_proxy_base", "TMDB 图片代理 /api/t/p 基址（留空走站点）", md=6)),
-                    # 二进制路径
-                    _row(_text("ffmpeg_bin", "ffmpeg 路径", "ffmpeg", md=6),
-                         _text("ffprobe_bin", "ffprobe 路径", "ffprobe", md=6)),
-                    _row(_text("mediastreamvalidator_bin", "Apple mediastreamvalidator 路径（可选校验）", "mediastreamvalidator", md=12)),
-                    # Telegram (可选)
-                    _row(_text("tg_bot_token", "Telegram Bot Token (可选)", md=6, ptype="password"),
-                         _text("tg_chat_id", "Telegram Chat ID (可选)", md=6)),
-                    _row({
-                        "component": "VCol", "props": {"cols": 12},
-                        "content": [{
-                            "component": "VAlert",
-                            "props": {
-                                "type": "info", "variant": "tonal",
-                                "text": ("整理完成后，插件等待指定延迟确认文件存在，"
-                                         "再在后台队列内依次完成 FFmpeg HLS 切片→R2上传→站点入库。\n"
-                                         "R2 配置：填一个 Cloudflare R2 API Token 即可自动获取账户ID/密钥/桶，无需手填。\n"
-                                         "TMDB：留空自动用 MoviePilot 自带；直连失败时走 tmdb.liubei.org 中继（代连 TMDB 官方，不读站点库）。\n"
-                                         "切片：FFmpeg fMP4 HLS（视频 copy + 默认音轨杜比转 AAC）；mediastreamvalidator 可选校验。\n"
-                                         "字幕：优先提取内嵌字幕；内嵌无中文时自动读取同目录同名/同季集 .ass/.srt 外挂字幕（内嵌与外挂均有中文时仅用内嵌）。\n"
-                                         "因此通常只需填：CF API Token + 流媒体站地址 + 站点认证。"),
-                            },
-                        }],
-                    }),
+                    _row(_text("api_base", "② 流媒体站地址", "https://your-domain.example", md=6),
+                         _text("api_admin_key", "③ 站点 Admin Key", md=6, ptype="password")),
+                    _row(_text("r2_bucket", "R2 存储桶名", "flix-800-assets", md=6),
+                         _switch("cf_create_bucket", "桶不存在时自动创建", md=6)),
+                    _row(_switch("watch_enabled", "实时监控媒体库", md=3),
+                         _switch("scan_on_start", "启动后扫描补传", md=3),
+                         _text("watch_delay", "监控延迟(秒)", "20", md=3, ptype="number"),
+                         _switch("show_advanced", "显示高级选项", md=3)),
+                    _advanced_row(_text("delay", "提交延迟(秒)", "30", md=3, ptype="number"),
+                                  _text("segment_seconds", "切片时长(秒)", "6", md=3, ptype="number"),
+                                  _text("concurrency", "上传并发数", "8", md=3, ptype="number"),
+                                  _text("reconcile_interval", "对账间隔(分)", "30", md=3, ptype="number")),
+                    _advanced_row(_text("scan_interval", "定时扫描(分，0=禁用)", "0", md=4, ptype="number"),
+                                  _textarea("watch_dirs", "监控目录（一行一个，留空=媒体库）",
+                                            "/media/library", md=8)),
+                    _advanced_row(_text("r2_account_id", "R2 账户 ID（手动）", md=4),
+                                  _text("r2_access_key_id", "R2 Access Key（手动）", md=4),
+                                  _text("r2_secret_access_key", "R2 Secret Key（手动）", md=4, ptype="password")),
+                    _advanced_row(_text("api_username", "站点用户名（无 Admin Key 时）", md=6),
+                                  _text("api_password", "站点密码", md=6, ptype="password")),
+                    _advanced_row(_text("tmdb_token", "TMDB Token（留空=MoviePilot 自带）", md=12, ptype="password"),
+                                  _text("tmdb_proxy_base", "TMDB 代理基址", md=6),
+                                  _text("tmdb_image_proxy_base", "TMDB 图片代理", md=6)),
+                    _advanced_row(_text("ffmpeg_bin", "ffmpeg 路径", "ffmpeg", md=4),
+                                  _text("ffprobe_bin", "ffprobe 路径", "ffprobe", md=4),
+                                  _text("mediastreamvalidator_bin", "mediastreamvalidator（macOS 可选）",
+                                        "mediastreamvalidator", md=4)),
+                    _advanced_row(_text("tg_bot_token", "Telegram Bot Token", md=6, ptype="password"),
+                                  _text("tg_chat_id", "Telegram Chat ID", md=6)),
+                    _row({"component": "VCol", "props": {"cols": 12},
+                          "content": [{"component": "VAlert", "props": {
+                              "type": "info", "variant": "tonal", "density": "compact",
+                              "text": ("详情页可查看环境检测与任务进度。"
+                                       "环境未就绪时可 POST /refresh_env 重新检测。"
+                                       "整理完成后自动：切片 → R2 → 站点入库。"),
+                          }}]}),
                 ],
             }
         ], {
             "enabled": False, "notify": True, "clean_after": True, "auto_install": True,
+            "show_advanced": False,
             "delay": 30, "segment_seconds": 6, "concurrency": 8, "reconcile_interval": 30,
             "scan_interval": 0, "scan_on_start": True,
-            "watch_enabled": False, "watch_delay": 20, "watch_dirs": "",
+            "watch_enabled": True, "watch_delay": 20, "watch_dirs": "",
             "cf_api_token": "", "cf_create_bucket": False,
             "r2_account_id": "", "r2_bucket": "flix-800-assets",
             "r2_access_key_id": "", "r2_secret_access_key": "",
@@ -1126,20 +1162,27 @@ class CloudUploader(_PluginBase):
     def get_page(self) -> List[dict]:
         """插件详情页：显示环境检测 + 队列统计 + 任务进度。"""
         env = self._env_status or _env.probe_environment()
-        if env.get("ffmpeg_path"):
-            settings.FFMPEG_BIN = env["ffmpeg_path"]
-        if env.get("ffprobe_path"):
-            settings.FFPROBE_BIN = env["ffprobe_path"]
-        if env.get("mediastreamvalidator_path"):
-            settings.MEDIASTREAMVALIDATOR_BIN = env["mediastreamvalidator_path"]
-        if env.get("packager_path"):
-            settings.PACKAGER_BIN = env["packager_path"]
-        missing = settings.validate()
+        _env.apply_env_paths(env)
+        if self._enabled and not env.get("ready") and self._auto_install:
+            self._kick_env_resolve()
+            if self._env_resolve_running:
+                env_lines_extra = ["⏳ 正在后台安装/探测 ffmpeg … 刷新页面查看"]
+            else:
+                env_lines_extra = []
+        else:
+            env_lines_extra = []
 
-        env_lines = [_env.format_env_header(env)]
+        missing = settings.validate()
+        tmdb_auto = not (self._config.get("tmdb_token") or "").strip()
+        setup_lines = _env.format_setup_checklist(
+            missing, env, cf_auto=bool(self._cf_derived), tmdb_auto=tmdb_auto,
+        )
+
+        env_lines = setup_lines + [""] + [_env.format_env_header(env)]
         for tool in env.get("tools") or []:
             env_lines.append(_env.format_tool_line(tool))
-        env_lines.append("切片器: FFmpeg fMP4 HLS（内置 manifest 校验全平台可用）")
+        env_lines.append("切片器: FFmpeg fMP4 HLS（内置 manifest 校验，全平台可用）")
+        env_lines.extend(env_lines_extra)
         if missing:
             env_lines.append("⚠️ 配置缺失: " + "、".join(missing))
         else:

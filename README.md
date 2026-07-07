@@ -17,8 +17,13 @@ MoviePilot 插件仓库。
 | 可选 | mediastreamvalidator | Apple HLS Tools 手动安装 | 不适用 | 不适用 |
 | 可选 | packager | 字幕 fMP4 | 同左 | 同左 |
 
-- 详情页显示 **平台 + 工具状态 + 安装提示**；`env_ok` 只看 ffmpeg/ffprobe + 业务配置
-- 配置在插件界面填写（R2 / TMDB / 站点凭证），无需 `.env`
+**无脑上手（3 项）**
+
+1. Cloudflare API Token（自动配置 R2）
+2. 流媒体站地址 + Admin API Key
+3. 启用插件（TMDB 留空即用 MoviePilot 自带 Key）
+
+详情页有「上手检查」清单；环境 API：`POST /plugin/CloudUploader/refresh_env` 重新检测切片环境。
 - 站点 Admin 配置 Telegram 上新通知后，插件上传入库（首次绑定播放源）会自动推送到频道 [@TVBot800](https://t.me/TVBot800)
 
 ## 在 MoviePilot 中安装
