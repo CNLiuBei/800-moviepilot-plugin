@@ -5,7 +5,7 @@ MoviePilot V2 插件: 云端自动上传（全合并版）
 Apple HLS 切片（官方工具生成并校验）→ R2 上传 → TMDB 元数据 → 站点入库。
 
 无需再单独运行上传工具服务，插件丢进 MoviePilot 即可使用。
-依赖外部二进制：Apple HLS Tools、ffmpeg / ffprobe（必需，ffmpeg/ffprobe 缺失时自动回退 pip 包）。
+依赖外部二进制：ffmpeg / ffprobe（必需，全平台可 auto-install）；mediastreamvalidator 仅 macOS 可选。
 """
 import os
 import queue
@@ -26,7 +26,7 @@ from .uploader.runtime_config import settings
 from .uploader.runtime_config import ConfigError, normalize_base_url
 from .uploader.job_runner import run_job
 from .uploader import notify as _notify_mod
-from .uploader import installer as _installer
+from .uploader import env as _env
 from .uploader import cf_auto as _cf_auto
 
 
@@ -43,7 +43,7 @@ class CloudUploader(_PluginBase):
     plugin_name = "云端自动上传"
     plugin_desc = "整理完成后自动 FFmpeg HLS 切片→上传R2→入库到流媒体站，全流程在插件内完成。"
     plugin_icon = "upload.png"
-    plugin_version = "2.8.2"
+    plugin_version = "2.8.3"
     plugin_author = "cn"
     author_url = "https://github.com/CNLiuBei/800-moviepilot-plugin"
     plugin_config_prefix = "clouduploader_"
@@ -311,7 +311,7 @@ class CloudUploader(_PluginBase):
     def _prepare_env(self):
         """后台探测 ffmpeg/ffprobe（缺失时回退 pip 包）。"""
         try:
-            self._env_status = _installer.ensure_all(
+            self._env_status = _env.resolve_environment(
                 log=lambda m: logger.info(f"[CloudUploader] {m}"),
                 auto_install=self._auto_install,
             )
@@ -1125,25 +1125,21 @@ class CloudUploader(_PluginBase):
 
     def get_page(self) -> List[dict]:
         """插件详情页：显示环境检测 + 队列统计 + 任务进度。"""
-        env = self._env_status or _installer.probe_binaries()
+        env = self._env_status or _env.probe_environment()
         if env.get("ffmpeg_path"):
             settings.FFMPEG_BIN = env["ffmpeg_path"]
         if env.get("ffprobe_path"):
             settings.FFPROBE_BIN = env["ffprobe_path"]
         if env.get("mediastreamvalidator_path"):
             settings.MEDIASTREAMVALIDATOR_BIN = env["mediastreamvalidator_path"]
-        has_ffmpeg = bool(env.get("ffmpeg"))
-        has_ffprobe = bool(env.get("ffprobe"))
-        has_validator = bool(env.get("mediastreamvalidator"))
+        if env.get("packager_path"):
+            settings.PACKAGER_BIN = env["packager_path"]
         missing = settings.validate()
 
-        env_lines = []
-        env_lines.append(f"FFmpeg: {'✅ ' + settings.FFMPEG_BIN if has_ffmpeg else '❌ 未找到（将尝试自动安装）'}")
-        env_lines.append(f"FFprobe: {'✅ ' + settings.FFPROBE_BIN if has_ffprobe else '❌ 未找到'}")
-        env_lines.append(f"切片器: FFmpeg fMP4 HLS")
-        env_lines.append(
-            f"mediastreamvalidator: {'✅ ' + settings.MEDIASTREAMVALIDATOR_BIN if has_validator else '⚠️ 未安装（跳过校验）'}"
-        )
+        env_lines = [_env.format_env_header(env)]
+        for tool in env.get("tools") or []:
+            env_lines.append(_env.format_tool_line(tool))
+        env_lines.append("切片器: FFmpeg fMP4 HLS（内置 manifest 校验全平台可用）")
         if missing:
             env_lines.append("⚠️ 配置缺失: " + "、".join(missing))
         else:
@@ -1175,7 +1171,7 @@ class CloudUploader(_PluginBase):
             f"文件已不存在: {persisted['missing_file']}"
         )
 
-        env_ok = has_ffmpeg and has_ffprobe and not missing
+        env_ok = bool(env.get("ready")) and not missing
 
         # ─── 构建任务进度列表 ───
         progress_items = []

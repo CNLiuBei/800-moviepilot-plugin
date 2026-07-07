@@ -20,6 +20,7 @@ from threading import Thread
 from urllib.parse import unquote, urlparse
 
 from .runtime_config import settings
+from .env import resolve_tool
 from .parser import parse_filename
 from .slicer import apple_hls_slice, get_video_duration
 from .subtitles import resolve_subtitles_for_upload, generate_hls_subtitle_playlists
@@ -417,11 +418,12 @@ def _generate_manifests(output_dir: Path, cmaf_result: dict, log, subtitles_info
 
 
 def _validate_with_apple_tool(master_playlist: Path, log) -> None:
-    validator = shutil.which(settings.MEDIASTREAMVALIDATOR_BIN)
-    if not validator and os.path.isabs(settings.MEDIASTREAMVALIDATOR_BIN) and os.path.isfile(settings.MEDIASTREAMVALIDATOR_BIN):
-        validator = settings.MEDIASTREAMVALIDATOR_BIN
+    import sys
+    if sys.platform != "darwin":
+        return
+    validator = resolve_tool(settings.MEDIASTREAMVALIDATOR_BIN)
     if not validator:
-        log("   ⚠️ mediastreamvalidator 未安装，跳过 Apple 官方校验")
+        log("   ℹ️ mediastreamvalidator 未安装，已用内置 HLS 校验")
         return
     result = subprocess.run(
         [validator, str(master_playlist)],

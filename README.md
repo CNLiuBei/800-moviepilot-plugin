@@ -6,12 +6,19 @@ MoviePilot 插件仓库。
 
 ### CloudUploader（云端自动上传）
 
-整理完成后自动 **Apple HLS 切片 → R2 上传 → TMDB 元数据 → 站点入库**，全流程在插件进程内完成，无需独立服务。
+整理完成后自动 **FFmpeg fMP4 HLS 切片 → R2 上传 → TMDB 元数据 → 站点入库**，全流程在插件进程内完成，无需独立服务。
 
-- 切片由 **FFmpeg** 生成 fMP4 HLS；可选 `mediastreamvalidator` 校验
-- `ffmpeg`/`ffprobe` 用于源文件探测和中间 MP4 准备，优先用系统自带、缺失回退 pip（`static-ffmpeg`）；Apple 官方 HLS Tools 需从 Apple Developer 下载并手动安装
-- 配置全部在插件界面填写（R2 / TMDB / 站点凭证），无需 `.env`
-- 详情页显示环境检测与任务队列状态
+**环境（跨平台）**
+
+| 层级 | 组件 | macOS | Linux/Docker | Windows |
+|------|------|-------|--------------|---------|
+| 必需 | ffmpeg / ffprobe | PATH / Homebrew / auto-install | 镜像内置或 auto-install | auto-install (`static-ffmpeg`) |
+| 内置 | manifest 校验 | ✅ | ✅ | ✅ |
+| 可选 | mediastreamvalidator | Apple HLS Tools 手动安装 | 不适用 | 不适用 |
+| 可选 | packager | 字幕 fMP4 | 同左 | 同左 |
+
+- 详情页显示 **平台 + 工具状态 + 安装提示**；`env_ok` 只看 ffmpeg/ffprobe + 业务配置
+- 配置在插件界面填写（R2 / TMDB / 站点凭证），无需 `.env`
 - 站点 Admin 配置 Telegram 上新通知后，插件上传入库（首次绑定播放源）会自动推送到频道 [@TVBot800](https://t.me/TVBot800)
 
 ## 在 MoviePilot 中安装

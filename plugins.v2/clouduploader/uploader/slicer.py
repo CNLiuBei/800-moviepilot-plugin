@@ -518,17 +518,18 @@ def pack_subtitles_fmp4(
         [{"lang": "zh-Hans", "name": "简体中文", "dir": "subs/zhs",
           "uri": "subs/zhs/stream.m3u8", "init": "subs/zhs/init.mp4"}, ...]
     """
+    from .env import resolve_tool
     from .runtime_config import settings
     import subprocess
 
     if print_fn is None:
         print_fn = print
 
-    packager_bin = settings.PACKAGER_BIN
-    import shutil as _shutil
-    if not _shutil.which(packager_bin):
+    packager_bin = resolve_tool(settings.PACKAGER_BIN)
+    if not packager_bin:
         print_fn("   ⚠️ Shaka Packager 不可用，跳过字幕 fMP4 打包")
         return []
+    settings.PACKAGER_BIN = packager_bin
 
     LANG_MAP = {
         'zho': ('zh-Hans', '简体中文'), 'chi': ('zh-Hans', '简体中文'),
