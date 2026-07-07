@@ -17,8 +17,32 @@ from typing import Optional
 
 from .runtime_config import settings
 
+# ponytail: fixed list; add paths via plugin ffmpeg_bin / ffprobe_bin settings
+_COMMON_BIN_DIRS = (
+    "/usr/local/bin",
+    "/opt/homebrew/bin",
+    "/usr/bin",
+    "/bin",
+)
+
 
 # ─── ffmpeg / ffprobe ───
+
+def _pip_install_static_ffmpeg(log=print) -> bool:
+    """pip 安装 static-ffmpeg（提供 ffmpeg + ffprobe）。"""
+    try:
+        import subprocess
+        import sys
+        log("   ffmpeg/ffprobe: 尝试 pip 安装 static-ffmpeg …")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "static-ffmpeg", "-q"],
+            timeout=300,
+        )
+        return True
+    except Exception as e:
+        log(f"   ffmpeg/ffprobe: pip 安装 static-ffmpeg 失败 ({e})")
+        return False
+
 
 def _resolve_ffmpeg_from_pip() -> tuple[Optional[str], Optional[str]]:
     """尝试从 pip 包获取 ffmpeg/ffprobe 路径。返回 (ffmpeg, ffprobe)，任一缺失为 None。"""
@@ -49,14 +73,13 @@ def _resolve_ffmpeg_from_pip() -> tuple[Optional[str], Optional[str]]:
     return ffmpeg_path, ffprobe_path
 
 
-def ensure_ffmpeg(log=print) -> tuple[bool, bool]:
+def ensure_ffmpeg(log=print, auto_install: bool = True) -> tuple[bool, bool]:
     """
     确保 ffmpeg/ffprobe 可用，回写 settings.FFMPEG_BIN / FFPROBE_BIN。
     返回 (has_ffmpeg, has_ffprobe)。
     """
-    # 1. 系统 PATH（含用户自定义路径）
-    sys_ffmpeg = shutil.which(settings.FFMPEG_BIN)
-    sys_ffprobe = shutil.which(settings.FFPROBE_BIN)
+    sys_ffmpeg = _resolve_tool(settings.FFMPEG_BIN)
+    sys_ffprobe = _resolve_tool(settings.FFPROBE_BIN)
     if sys_ffmpeg:
         settings.FFMPEG_BIN = sys_ffmpeg
     if sys_ffprobe:
@@ -65,7 +88,9 @@ def ensure_ffmpeg(log=print) -> tuple[bool, bool]:
     has_ffmpeg = bool(sys_ffmpeg)
     has_ffprobe = bool(sys_ffprobe)
 
-    # 2. 缺失则尝试 pip 包
+    if not (has_ffmpeg and has_ffprobe) and auto_install:
+        _pip_install_static_ffmpeg(log=log)
+
     if not (has_ffmpeg and has_ffprobe):
         pip_ffmpeg, pip_ffprobe = _resolve_ffmpeg_from_pip()
         if not has_ffmpeg and pip_ffmpeg and os.path.isfile(pip_ffmpeg):
@@ -80,11 +105,26 @@ def ensure_ffmpeg(log=print) -> tuple[bool, bool]:
     return has_ffmpeg, has_ffprobe
 
 
-def ensure_all(log=print) -> dict:
+def probe_binaries() -> dict:
+    """只读探测当前 ffmpeg/ffprobe/mediastreamvalidator 是否可用（不触发 pip 安装）。"""
+    ffmpeg = _resolve_tool(settings.FFMPEG_BIN)
+    ffprobe = _resolve_tool(settings.FFPROBE_BIN)
+    validator = _resolve_tool(settings.MEDIASTREAMVALIDATOR_BIN)
+    return {
+        "ffmpeg": bool(ffmpeg),
+        "ffprobe": bool(ffprobe),
+        "mediastreamvalidator": bool(validator),
+        "ffmpeg_path": ffmpeg or settings.FFMPEG_BIN,
+        "ffprobe_path": ffprobe or settings.FFPROBE_BIN,
+        "mediastreamvalidator_path": validator,
+    }
+
+
+def ensure_all(log=print, auto_install: bool = True) -> dict:
     """
     一次性确保所有二进制可用。返回检测结果 dict。
     """
-    has_ffmpeg, has_ffprobe = ensure_ffmpeg(log=log)
+    has_ffmpeg, has_ffprobe = ensure_ffmpeg(log=log, auto_install=auto_install)
     has_packager = ensure_packager(log=log)
     has_validator = ensure_mediastreamvalidator(log=log)
     return {
@@ -129,6 +169,11 @@ def _resolve_tool(configured: str) -> str | None:
         return found
     if os.path.isabs(configured) and os.path.isfile(configured):
         return configured
+    if configured and "/" not in configured:
+        for d in _COMMON_BIN_DIRS:
+            candidate = os.path.join(d, configured)
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
     return None
 
 

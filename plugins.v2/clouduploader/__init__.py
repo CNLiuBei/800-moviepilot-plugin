@@ -43,7 +43,7 @@ class CloudUploader(_PluginBase):
     plugin_name = "云端自动上传"
     plugin_desc = "整理完成后自动 FFmpeg HLS 切片→上传R2→入库到流媒体站，全流程在插件内完成。"
     plugin_icon = "upload.png"
-    plugin_version = "2.8.1"
+    plugin_version = "2.8.2"
     plugin_author = "cn"
     author_url = "https://github.com/CNLiuBei/800-moviepilot-plugin"
     plugin_config_prefix = "clouduploader_"
@@ -313,6 +313,7 @@ class CloudUploader(_PluginBase):
         try:
             self._env_status = _installer.ensure_all(
                 log=lambda m: logger.info(f"[CloudUploader] {m}"),
+                auto_install=self._auto_install,
             )
             logger.info(f"[CloudUploader] 环境就绪: ffmpeg={self._env_status.get('ffmpeg')} "
                         f"ffprobe={self._env_status.get('ffprobe')}")
@@ -1124,10 +1125,16 @@ class CloudUploader(_PluginBase):
 
     def get_page(self) -> List[dict]:
         """插件详情页：显示环境检测 + 队列统计 + 任务进度。"""
-        env = self._env_status or {}
-        has_ffmpeg = bool(env.get("ffmpeg")) if env else bool(shutil.which(settings.FFMPEG_BIN))
-        has_ffprobe = bool(env.get("ffprobe")) if env else bool(shutil.which(settings.FFPROBE_BIN))
-        has_validator = bool(env.get("mediastreamvalidator")) if env else bool(shutil.which(settings.MEDIASTREAMVALIDATOR_BIN))
+        env = self._env_status or _installer.probe_binaries()
+        if env.get("ffmpeg_path"):
+            settings.FFMPEG_BIN = env["ffmpeg_path"]
+        if env.get("ffprobe_path"):
+            settings.FFPROBE_BIN = env["ffprobe_path"]
+        if env.get("mediastreamvalidator_path"):
+            settings.MEDIASTREAMVALIDATOR_BIN = env["mediastreamvalidator_path"]
+        has_ffmpeg = bool(env.get("ffmpeg"))
+        has_ffprobe = bool(env.get("ffprobe"))
+        has_validator = bool(env.get("mediastreamvalidator"))
         missing = settings.validate()
 
         env_lines = []
