@@ -27,7 +27,7 @@ from .subtitles import resolve_subtitles_for_upload, generate_hls_subtitle_playl
 from .tmdb import get_original_language, verify_tmdb_metadata
 from .register import auto_register, write_episode_nfo, write_show_nfo
 from .notify import notify_upload_success, notify_upload_failed
-from .r2 import get_s3_client, _MIME_MAP
+from .r2 import get_s3_client, upload_file_resilient, _MIME_MAP
 from .direct_media import prepare_direct_mp4
 from .upload_policy import direct_mode_enabled
 
@@ -129,7 +129,13 @@ def upload_directory_smart(local_dir: Path, r2_prefix: str, on_progress, cancel_
         local_size = f.stat().st_size
         key = f"{r2_prefix}/{rel_key}"
         ct = _MIME_MAP.get(f.suffix.lower(), "application/octet-stream")
-        s3.upload_file(str(f), settings.R2_BUCKET, key, ExtraArgs={"ContentType": ct})
+        upload_file_resilient(
+            s3,
+            str(f),
+            settings.R2_BUCKET,
+            key,
+            extra_args={"ContentType": ct},
+        )
         return "ok", local_size
 
     def upload_phase(phase_files: list[Path]) -> None:
@@ -349,12 +355,13 @@ def upload_mp4_direct(
                 last_logged[0] = tier
                 on_progress(pct, speed, eta)
 
-        s3.upload_file(
+        upload_file_resilient(
+            s3,
             str(local_path),
             settings.R2_BUCKET,
             key,
-            ExtraArgs={"ContentType": ct},
-            Callback=progress_cb,
+            extra_args={"ContentType": ct},
+            callback=progress_cb,
         )
         uploaded_bytes += local_path.stat().st_size
         uploaded += 1

@@ -1,12 +1,30 @@
 """
 R2 上传模块（插件内嵌版）
 """
+from __future__ import annotations
+
 import boto3
+from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
 
 from .runtime_config import ConfigError, settings
 
-_BOTO_CONFIG = Config(proxies={})
+# Slow uplinks (≈0.5 MB/s) need long read timeouts for multipart parts.
+_BOTO_CONFIG = Config(
+    proxies={},
+    connect_timeout=30,
+    read_timeout=900,
+    retries={"max_attempts": 8, "mode": "standard"},
+    max_pool_connections=20,
+)
+
+# Smaller parts + modest concurrency reduce per-part timeout risk on slow links.
+_TRANSFER_CONFIG = TransferConfig(
+    multipart_threshold=8 * 1024 * 1024,
+    multipart_chunksize=8 * 1024 * 1024,
+    max_concurrency=2,
+    use_threads=True,
+)
 
 _MIME_MAP = {
     ".m3u8": "application/vnd.apple.mpegurl",
@@ -40,4 +58,29 @@ def get_s3_client():
         aws_secret_access_key=settings.R2_SECRET_ACCESS_KEY,
         region_name="auto",
         config=_BOTO_CONFIG,
+    )
+
+
+def get_transfer_config() -> TransferConfig:
+    """Return the shared multipart transfer settings for large R2 uploads."""
+    return _TRANSFER_CONFIG
+
+
+def upload_file_resilient(
+    s3,
+    filename: str,
+    bucket: str,
+    key: str,
+    *,
+    extra_args: dict | None = None,
+    callback=None,
+) -> None:
+    """Upload with long timeouts and conservative multipart settings."""
+    s3.upload_file(
+        filename,
+        bucket,
+        key,
+        ExtraArgs=extra_args or {},
+        Callback=callback,
+        Config=get_transfer_config(),
     )

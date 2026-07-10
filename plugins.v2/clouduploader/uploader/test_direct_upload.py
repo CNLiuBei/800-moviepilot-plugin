@@ -34,13 +34,15 @@ class DirectUploadTests(unittest.TestCase):
         self.list_mock = self.list_patcher.start()
         self.addCleanup(patch.stopall)
 
-    def _upload_file(self, local_path, _bucket, key, ExtraArgs, Callback):
+    def _upload_file(self, local_path, _bucket, key, ExtraArgs=None, Callback=None, Config=None):
+        del Config
         size = Path(local_path).stat().st_size
         self.uploaded[key] = {
             "ContentLength": size,
-            "ContentType": ExtraArgs["ContentType"],
+            "ContentType": (ExtraArgs or {})["ContentType"],
         }
-        Callback(size)
+        if Callback:
+            Callback(size)
 
     def _head_uploaded_object(self, Bucket, Key):
         del Bucket
