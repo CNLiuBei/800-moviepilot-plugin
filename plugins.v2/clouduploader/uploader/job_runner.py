@@ -16,7 +16,7 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from threading import Thread
+from threading import Event, Thread
 from urllib.parse import unquote, urlparse
 
 from .runtime_config import settings
@@ -332,6 +332,13 @@ def upload_mp4_direct(
     uploaded = 0
     start_time = time.time()
 
+    def _emit_progress(done: int) -> None:
+        elapsed = time.time() - start_time
+        speed = done / elapsed if elapsed > 0 else 0
+        eta = (total_bytes - done) / speed if speed > 0 else 0
+        pct = done / total_bytes if total_bytes else 1.0
+        on_progress(pct, speed, eta)
+
     for local_path, rel_key in uploads:
         if cancel_check():
             raise RuntimeError("上传已取消")
@@ -340,31 +347,35 @@ def upload_mp4_direct(
             local_path.suffix.lower(), "application/octet-stream"
         )
 
-        last_progress_at = [0.0]
         file_done = [0]
+        stop_ticker = Event()
 
         def progress_cb(bytes_amount):
             file_done[0] += bytes_amount
-            done = uploaded_bytes + file_done[0]
-            elapsed = time.time() - start_time
-            speed = done / elapsed if elapsed > 0 else 0
-            eta = (total_bytes - done) / speed if speed > 0 else 0
-            pct = done / total_bytes if total_bytes else 1.0
-            now = time.time()
-            if pct >= 1 or now - last_progress_at[0] >= 3.0:
-                last_progress_at[0] = now
-                on_progress(pct, speed, eta)
 
-        upload_file_resilient(
-            s3,
-            str(local_path),
-            settings.R2_BUCKET,
-            key,
-            extra_args={"ContentType": ct},
-            callback=progress_cb,
-        )
-        uploaded_bytes += local_path.stat().st_size
-        uploaded += 1
+        def progress_ticker():
+            while not stop_ticker.wait(3.0):
+                _emit_progress(uploaded_bytes + file_done[0])
+
+        ticker = Thread(target=progress_ticker, name="r2-upload-progress", daemon=True)
+        ticker.start()
+        try:
+            # 立即打一条 0%，之后由 ticker 每 3 秒汇报，不依赖 boto Callback 频率
+            _emit_progress(uploaded_bytes)
+            upload_file_resilient(
+                s3,
+                str(local_path),
+                settings.R2_BUCKET,
+                key,
+                extra_args={"ContentType": ct},
+                callback=progress_cb,
+            )
+            uploaded_bytes += local_path.stat().st_size
+            _emit_progress(uploaded_bytes)
+            uploaded += 1
+        finally:
+            stop_ticker.set()
+            ticker.join(timeout=1.0)
 
     for local_path, rel_key in uploads:
         key = f"{r2_prefix}/{rel_key}"
