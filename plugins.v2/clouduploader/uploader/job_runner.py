@@ -340,7 +340,7 @@ def upload_mp4_direct(
             local_path.suffix.lower(), "application/octet-stream"
         )
 
-        last_logged = [0]
+        last_progress_at = [0.0]
         file_done = [0]
 
         def progress_cb(bytes_amount):
@@ -350,9 +350,9 @@ def upload_mp4_direct(
             speed = done / elapsed if elapsed > 0 else 0
             eta = (total_bytes - done) / speed if speed > 0 else 0
             pct = done / total_bytes if total_bytes else 1.0
-            tier = int(pct * 10)
-            if tier > last_logged[0] or pct >= 1:
-                last_logged[0] = tier
+            now = time.time()
+            if pct >= 1 or now - last_progress_at[0] >= 3.0:
+                last_progress_at[0] = now
                 on_progress(pct, speed, eta)
 
         upload_file_resilient(
@@ -827,15 +827,16 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
             start = time.time()
             _put_upload_marker(r2_path, "uploading", {"file": Path(filepath).name}, log)
 
-            upload_last_log = [0]
+            upload_last_log_at = [0.0]
 
             def upload_progress(p, speed=0, eta=0):
-                tier = int(p * 10)
-                if tier > upload_last_log[0]:
-                    upload_last_log[0] = tier
-                    speed_mb = speed / (1024 * 1024)
-                    eta_str = f" | ETA {int(eta)}s" if eta > 0 else ""
-                    log(f"   上传 {int(p*100)}%  ({time.time()-start:.1f}s, {speed_mb:.1f} MB/s{eta_str})")
+                now = time.time()
+                if p < 1 and now - upload_last_log_at[0] < 3.0:
+                    return
+                upload_last_log_at[0] = now
+                speed_mb = speed / (1024 * 1024)
+                eta_str = f" | ETA {int(eta)}s" if eta > 0 else ""
+                log(f"   上传 {int(p*100)}%  ({now - start:.1f}s, {speed_mb:.1f} MB/s{eta_str})")
 
             if direct_mp4:
                 log("📤 不分片直传 R2 (video.mp4)...")
