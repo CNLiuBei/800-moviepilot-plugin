@@ -185,17 +185,22 @@ def _upload_tmdb_image(path: str, size: str, r2_key: str, print_fn, label: str) 
 
 def _api_error(resp: httpx.Response, prefix: str) -> str:
     """从 API 响应中提取可读错误信息。"""
+    payload = {}
     try:
         data = resp.json()
         if isinstance(data, dict):
-            msg = data.get("message") or data.get("error") or data.get("status_message")
-            if msg:
-                return f"{prefix} [{resp.status_code}] — {msg}"
-    except (ValueError, json.JSONDecodeError):
-        pass
-    text = (resp.text or "").strip()
-    if text:
-        return f"{prefix} [{resp.status_code}] — {text[:500]}"
+            payload = data
+    except (ValueError, json.JSONDecodeError, TypeError):
+        payload = {}
+    detail = (
+        payload.get("message")
+        or payload.get("detail")
+        or payload.get("error")
+        or payload.get("status_message")
+        or (resp.text or "").strip()[:500]
+    )
+    if detail:
+        return f"{prefix} [{resp.status_code}] — {detail}"
     return f"{prefix} [{resp.status_code}]"
 
 
@@ -321,11 +326,12 @@ def _do_register(
     subtitles: list[dict], duration_secs: int | None,
     source_type: str, print_fn,
 ) -> tuple[bool, str]:
-    play_url = (
-        f"/api/r2/{r2_path}/master.m3u8"
-        if source_type == "cmaf"
-        else f"/api/r2/{r2_path}/stream.m3u8"
-    )
+    if source_type == "cmaf":
+        play_url = f"/api/r2/{r2_path}/master.m3u8"
+    elif source_type == "mp4":
+        play_url = f"/api/r2/{r2_path}/video.mp4"
+    else:
+        play_url = f"/api/r2/{r2_path}/stream.m3u8"
 
     # TV/动漫：导入时同步全部分集，保证详情页剧集列表可用
     ok, err = _import_tmdb(client, tmdb_id, media_type, fetch_episodes=(media_type == "tv"), print_fn=print_fn)

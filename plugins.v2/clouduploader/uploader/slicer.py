@@ -28,11 +28,11 @@ _TRANSCODE_TO_AAC_AUDIO_CODECS = frozenset({
 })
 
 
-def get_video_duration(filepath: str) -> int | None:
+def get_video_duration(filepath: str, ffprobe_bin: str | None = None) -> int | None:
     """用 ffprobe 读取视频真实时长, 返回秒数 (整数), 失败返回 None。"""
     try:
         result = subprocess.run(
-            [settings.FFPROBE_BIN, "-v", "quiet",
+            [ffprobe_bin or settings.FFPROBE_BIN, "-v", "quiet",
              "-show_entries", "format=duration",
              "-of", "csv=p=0", filepath],
             capture_output=True, text=True, timeout=30,
@@ -45,16 +45,17 @@ def get_video_duration(filepath: str) -> int | None:
     return None
 
 
-def probe_video_info(input_path: str) -> dict:
+def probe_video_info(input_path: str, ffprobe_bin: str | None = None) -> dict:
     """用 ffprobe 探测源视频编码、分辨率、码率和时长。"""
+    ffprobe = ffprobe_bin or settings.FFPROBE_BIN
     probe_stream = subprocess.run(
-        [settings.FFPROBE_BIN, "-v", "quiet", "-select_streams", "v:0",
+        [ffprobe, "-v", "quiet", "-select_streams", "v:0",
          "-show_entries", "stream=codec_name,profile,level,width,height,bit_rate,avg_frame_rate,r_frame_rate",
          "-of", "json", input_path],
         capture_output=True, text=True, timeout=60,
     )
     probe_format = subprocess.run(
-        [settings.FFPROBE_BIN, "-v", "quiet",
+        [ffprobe, "-v", "quiet",
          "-show_entries", "format=duration,bit_rate",
          "-of", "json", input_path],
         capture_output=True, text=True, timeout=60,
@@ -120,10 +121,10 @@ def probe_video_info(input_path: str) -> dict:
     return info
 
 
-def probe_audio_streams(input_path: str) -> list[dict]:
+def probe_audio_streams(input_path: str, ffprobe_bin: str | None = None) -> list[dict]:
     """探测所有音轨，返回 [{audio_index, lang, title, codec, channels}, ...]。"""
     result = subprocess.run(
-        [settings.FFPROBE_BIN, "-v", "quiet", "-print_format", "json",
+        [ffprobe_bin or settings.FFPROBE_BIN, "-v", "quiet", "-print_format", "json",
          "-show_streams", "-select_streams", "a", input_path],
         capture_output=True, text=True, timeout=60,
     )

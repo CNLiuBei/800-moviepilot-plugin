@@ -25,6 +25,13 @@ from app.schemas.types import EventType, NotificationType
 from .uploader.runtime_config import settings
 from .uploader.runtime_config import ConfigError, normalize_base_url
 from .uploader.job_runner import run_job
+from .uploader.upload_policy import (
+    direct_mode_enabled,
+    normalize_upload_mode,
+    recovery_policy_from_marker,
+    recovery_policy_from_source_type,
+    validate_upload_identity,
+)
 from .uploader import notify as _notify_mod
 from .uploader import env as _env
 from .uploader import cf_auto as _cf_auto
@@ -42,9 +49,9 @@ def _episode_label(season, episode) -> str:
 class CloudUploader(_PluginBase):
     # ─── 插件元信息 ───
     plugin_name = "云端自动上传"
-    plugin_desc = "整理完成后自动 FFmpeg HLS 切片→上传R2→入库到流媒体站，全流程在插件内完成。"
+    plugin_desc = "默认 MP4 直传（可选 HLS），整理完成后自动上传 R2 并入库到流媒体站。"
     plugin_icon = "upload.png"
-    plugin_version = "2.8.5"
+    plugin_version = "2.8.6"
     plugin_author = "cn"
     author_url = "https://github.com/CNLiuBei/800-moviepilot-plugin"
     plugin_config_prefix = "clouduploader_"
@@ -61,6 +68,8 @@ class CloudUploader(_PluginBase):
     _watch_dirs: List[str] = []
     _watch_delay = 20
     _scan_on_start = True
+    _upload_mode = "direct"
+    _h264_compat = False
     _config_ready = False
     _config: dict = {}
 
@@ -109,6 +118,8 @@ class CloudUploader(_PluginBase):
         self._watch_enabled = bool(config.get("watch_enabled", False))
         self._watch_delay = int(config.get("watch_delay") or 20)
         self._scan_on_start = bool(config.get("scan_on_start", True))
+        self._upload_mode = normalize_upload_mode(config.get("upload_mode"))
+        self._h264_compat = bool(config.get("h264_compat", False))
         self._watch_dirs = self._parse_watch_dirs(config.get("watch_dirs", ""))
         self._stop_directory_watch()
 
@@ -336,7 +347,7 @@ class CloudUploader(_PluginBase):
             self._env_resolve_running = False
 
     def _ensure_slice_env(self, force: bool = False) -> bool:
-        """任务入队前确保切片环境可用（必要时同步触发 auto-install）。"""
+        """任务入队前确保媒体处理环境可用（必要时同步触发 auto-install）。"""
         if self._env_status.get("ready") and not force:
             return True
         with self._env_lock:
@@ -436,6 +447,7 @@ class CloudUploader(_PluginBase):
                     self._stats["error"] += 1
                     retry_params = params
                     if result.get("stage") == "register" and result.get("r2_path"):
+                        source_type = "mp4" if direct_mode_enabled(params) else "hls"
                         retry_params = {
                             **params,
                             "remote_uploaded": True,
@@ -444,6 +456,12 @@ class CloudUploader(_PluginBase):
                             "skip_upload": True,
                             "no_subtitles": True,
                             "clean_after": False,
+                            "upload_mode": params.get(
+                                "upload_mode",
+                                "direct" if source_type == "mp4" else "hls",
+                            ),
+                            "direct_mp4": source_type == "mp4",
+                            "h264_compat": bool(params.get("h264_compat")),
                         }
                     self._record_task(key, retry_params, "error",
                                       error=result.get("error", ""), stage=result.get("stage", ""))
@@ -480,7 +498,7 @@ class CloudUploader(_PluginBase):
                 self._record_task(key, params, "error", error=error, stage="precheck")
             return False
         if not self._ensure_slice_env():
-            error = "切片环境未就绪: 未找到 ffmpeg/ffprobe，请开启自动安装或填写路径"
+            error = "媒体处理环境未就绪: 未找到 ffmpeg/ffprobe，请开启自动安装或填写路径"
             logger.warning(f"[CloudUploader] {error}，跳过入队: {key}")
             if record:
                 self._record_task(key, params, "error", error=error, stage="precheck")
@@ -554,8 +572,15 @@ class CloudUploader(_PluginBase):
                 "path": "/refresh_env",
                 "endpoint": self.api_refresh_env,
                 "methods": ["POST"],
-                "summary": "重新检测切片环境",
+                "summary": "重新检测媒体处理环境",
                 "description": "重新探测 ffmpeg/ffprobe，必要时触发 static-ffmpeg 自动安装。",
+            },
+            {
+                "path": "/upload",
+                "endpoint": self.api_upload,
+                "methods": ["POST"],
+                "summary": "手动入队上传任务",
+                "description": "指定本地文件与 TMDB 信息入队。direct_mp4=true 时准备兼容 MP4 后直传。",
             },
         ]
 
@@ -577,8 +602,92 @@ class CloudUploader(_PluginBase):
 
     def api_refresh_env(self) -> dict:
         ready = self._ensure_slice_env(force=True)
-        msg = "切片环境已就绪" if ready else "仍未找到 ffmpeg/ffprobe，请检查日志或填写路径"
-        return {"success": ready, "ready": ready, "message": msg, "platform": self._env_status.get("platform")}
+        return {
+            "success": True,
+            "ready": bool(ready),
+            "message": "媒体处理环境已就绪" if ready else "媒体处理环境未就绪",
+            "platform": (self._env_status or {}).get("platform") or "",
+        }
+
+    def api_upload(
+        self,
+        filepath: str,
+        tmdb_id: int,
+        media_type: str = "movie",
+        season: int = None,
+        episode: int = None,
+        upload_mode: str = "",
+        direct_mp4: Optional[bool] = None,
+        h264_compat: Optional[bool] = None,
+        clean_after: Optional[bool] = None,
+        force_overwrite: Optional[bool] = None,
+        resolution: str = "",
+    ) -> dict:
+        """手动入队上传，默认准备兼容 MP4 后直传，也可显式选择 HLS。"""
+        if not self._enabled:
+            return {"success": False, "message": "插件未启用"}
+        if not self._config_ready:
+            return {"success": False, "message": "配置缺失: " + "、".join(settings.validate())}
+
+        filepath = (filepath or "").strip()
+        if not filepath or not os.path.isfile(filepath):
+            return {"success": False, "message": f"文件不存在: {filepath or '(空)'}"}
+
+        try:
+            tmdb_id = int(tmdb_id)
+        except (TypeError, ValueError):
+            return {"success": False, "message": "需要有效的 tmdb_id"}
+        if tmdb_id <= 0:
+            return {"success": False, "message": "需要有效的 tmdb_id"}
+
+        media_type, season, episode, identity_error = validate_upload_identity(
+            media_type, season, episode
+        )
+        if identity_error:
+            return {"success": False, "message": identity_error}
+
+        params = self._build_upload_params(
+            filepath=filepath,
+            tmdb_id=tmdb_id,
+            media_type=media_type,
+            season=season,
+            episode=episode,
+        )
+        mode_value = upload_mode or self._upload_mode
+        if not upload_mode and direct_mp4 is not None:
+            mode_value = "direct" if direct_mode_enabled({"direct_mp4": direct_mp4}) else "hls"
+        mode = normalize_upload_mode(mode_value)
+        params["upload_mode"] = mode
+        params["direct_mp4"] = mode == "direct"
+        params["skip_slice"] = mode == "direct"
+        params["h264_compat"] = self._h264_compat if h264_compat is None else bool(h264_compat)
+        params["clean_after"] = self._clean_after if clean_after is None else bool(clean_after)
+        params["force_overwrite"] = False if force_overwrite is None else bool(force_overwrite)
+        if resolution:
+            params["resolution"] = str(resolution)
+        elif "1080" in Path(filepath).name:
+            params["resolution"] = "1080p"
+
+        enqueued = self._enqueue(params)
+        if not enqueued:
+            return {"success": False, "message": "任务已在队列中或入队失败", "filepath": filepath, "tmdb_id": tmdb_id}
+        return {
+            "success": True,
+            "message": "已入队" + ("（不分片直传）" if mode == "direct" else "（HLS 切片上传）"),
+            "filepath": filepath,
+            "tmdb_id": tmdb_id,
+            "media_type": media_type,
+            "season": season,
+            "episode": episode,
+            "upload_mode": mode,
+            "direct_mp4": mode == "direct",
+            "h264_compat": bool(params["h264_compat"]),
+            "r2_path": (
+                f"tmdb/{media_type}/{tmdb_id}/season/{season}/episode/{episode}"
+                if season is not None and episode is not None
+                else f"tmdb/{media_type}/{tmdb_id}"
+            ),
+        }
 
     def get_service(self) -> List[Dict[str, Any]]:
         """注册定时服务：对账兜底 + 媒体库目录扫描补传。"""
@@ -670,6 +779,9 @@ class CloudUploader(_PluginBase):
             "season": season,
             "episode": episode,
             "cmaf": True,
+            "upload_mode": self._upload_mode,
+            "direct_mp4": self._upload_mode == "direct",
+            "h264_compat": self._h264_compat,
             "clean_after": self._clean_after,
             "cleanup_roots": cleanup_roots if cleanup_roots is not None else self._cleanup_roots(),
             "cleanup_parent_depth": 2 if _has_episode_numbers(season, episode) else 1,
@@ -960,16 +1072,20 @@ class CloudUploader(_PluginBase):
 
             if not force_overwrite:
                 exists_key = None
-                for playlist in ("master.m3u8", "stream.m3u8"):
+                for media_object in ("master.m3u8", "stream.m3u8", "video.mp4"):
                     try:
-                        s3.head_object(Bucket=settings.R2_BUCKET, Key=f"{r2_path}/{playlist}")
-                        exists_key = playlist
+                        s3.head_object(Bucket=settings.R2_BUCKET, Key=f"{r2_path}/{media_object}")
+                        exists_key = media_object
                         break
                     except Exception:
                         continue
                 if not exists_key:
                     raise FileNotFoundError(f"{r2_path}/master.m3u8")
-                logger.info(f"[CloudUploader] 发现旧版已上传播放清单，补执行入库: {r2_path}/{exists_key}")
+                logger.info(f"[CloudUploader] 发现旧版已上传媒体，补执行入库: {r2_path}/{exists_key}")
+                source_hint = (
+                    "mp4" if exists_key == "video.mp4"
+                    else ("cmaf" if exists_key == "master.m3u8" else "hls")
+                )
                 return self._enqueue_remote_register(
                     filepath=filepath,
                     tmdb_id=tmdb_id,
@@ -978,6 +1094,7 @@ class CloudUploader(_PluginBase):
                     episode=episode,
                     has_uploaded_marker=False,
                     cleanup_roots=cleanup_roots,
+                    source_hint=source_hint,
                 )
         except Exception:
             pass  # head_object 抛 404 / NoSuchKey 表示不存在，继续入队
@@ -1009,7 +1126,8 @@ class CloudUploader(_PluginBase):
     def _enqueue_remote_register(self, filepath: str, tmdb_id, media_type: str,
                                  season=None, episode=None,
                                  has_uploaded_marker: bool = False,
-                                 cleanup_roots: Optional[List[str]] = None) -> str:
+                                 cleanup_roots: Optional[List[str]] = None,
+                                 source_hint: str = "") -> str:
         """R2 已有完整对象时，只补站点入库，不重复切片/上传。"""
         params = self._build_upload_params(
             filepath=filepath,
@@ -1027,6 +1145,31 @@ class CloudUploader(_PluginBase):
             "no_subtitles": True,
             "clean_after": False,
         })
+
+        recovery = None
+        if has_uploaded_marker:
+            if _has_episode_numbers(season, episode):
+                r2_path = f"tmdb/{media_type}/{tmdb_id}/season/{int(season)}/episode/{int(episode)}"
+            else:
+                r2_path = f"tmdb/{media_type}/{tmdb_id}"
+            from .uploader.job_runner import _read_upload_marker
+            marker = _read_upload_marker(r2_path, "uploaded", logger.info)
+            recovery = recovery_policy_from_marker(marker)
+        elif source_hint:
+            recovery = recovery_policy_from_source_type(source_hint)
+        else:
+            try:
+                from .uploader.job_runner import _remote_source_type
+                if _has_episode_numbers(season, episode):
+                    r2_path = f"tmdb/{media_type}/{tmdb_id}/season/{int(season)}/episode/{int(episode)}"
+                else:
+                    r2_path = f"tmdb/{media_type}/{tmdb_id}"
+                recovery = recovery_policy_from_source_type(_remote_source_type(r2_path))
+            except Exception:
+                recovery = None
+        if recovery:
+            params.update(recovery)
+
         enqueued = self._enqueue(params)
         if enqueued:
             logger.info(
@@ -1085,6 +1228,11 @@ class CloudUploader(_PluginBase):
                                  "props": {"model": model, "label": label,
                                            "placeholder": placeholder, "rows": 2}}]}
 
+        def _select(model, label, items, md=6):
+            return {"component": "VCol", "props": {"cols": 12, "md": md},
+                    "content": [{"component": "VSelect",
+                                 "props": {"model": model, "label": label, "items": items}}]}
+
         def _advanced_row(*cols):
             return {"component": "VRow", "props": {"v-show": "show_advanced"}, "content": list(cols)}
 
@@ -1118,6 +1266,11 @@ class CloudUploader(_PluginBase):
                          _switch("scan_on_start", "启动后扫描补传", md=3),
                          _text("watch_delay", "监控延迟(秒)", "20", md=3, ptype="number"),
                          _switch("show_advanced", "显示高级选项", md=3)),
+                    _row(_select("upload_mode", "上传模式", [
+                        {"title": "MP4 直传", "value": "direct"},
+                        {"title": "HLS 切片", "value": "hls"},
+                    ], md=6)),
+                    _advanced_row(_switch("h264_compat", "H.264 兼容转码", md=4)),
                     _advanced_row(_text("delay", "提交延迟(秒)", "30", md=3, ptype="number"),
                                   _text("segment_seconds", "切片时长(秒)", "6", md=3, ptype="number"),
                                   _text("concurrency", "上传并发数", "8", md=3, ptype="number"),
@@ -1155,6 +1308,7 @@ class CloudUploader(_PluginBase):
         ], {
             "enabled": False, "notify": True, "clean_after": True, "auto_install": True,
             "show_advanced": False,
+            "upload_mode": "direct", "h264_compat": False,
             "delay": 30, "segment_seconds": 6, "concurrency": 8, "reconcile_interval": 30,
             "scan_interval": 0, "scan_on_start": True,
             "watch_enabled": True, "watch_delay": 20, "watch_dirs": "",

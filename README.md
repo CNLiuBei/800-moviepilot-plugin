@@ -6,14 +6,34 @@ MoviePilot 插件仓库。
 
 ### CloudUploader（云端自动上传）
 
-整理完成后自动 **FFmpeg fMP4 HLS 切片 → R2 上传 → TMDB 元数据 → 站点入库**，全流程在插件进程内完成，无需独立服务。
+整理完成后自动 **默认 MP4 直传（可选 HLS 分片）→ R2 上传 → TMDB 元数据 → 站点入库**，全流程在插件进程内完成，无需独立服务。
+
+默认保留 H.265 体积优势；非浏览器安全音轨会转 AAC-LC。需要全浏览器兼容时可开启 `h264_compat`。
+
+**上传模式**
+
+```text
+upload_mode=direct     # 默认：准备兼容 MP4 后整文件直传
+upload_mode=hls        # 可选：CMAF fMP4 HLS 分片
+h264_compat=false      # 默认保留 H.265；true 时转 H.264
+```
+
+**手动入队示例**
+
+```bash
+curl -X POST \
+  -H "X-API-KEY: $MOVIEPILOT_API_TOKEN" \
+  "http://127.0.0.1:3001/api/v1/plugin/CloudUploader/upload?filepath=/media/movie.mkv&tmdb_id=1726601&media_type=movie&upload_mode=direct"
+```
+
+H.265/HEVC 播放仍取决于设备与浏览器能力；不支持时前端会提示切换兼容源或使用 Safari。
 
 **环境（跨平台）**
 
 | 层级 | 组件 | macOS | Linux/Docker | Windows |
 |------|------|-------|--------------|---------|
 | 必需 | ffmpeg / ffprobe | PATH / Homebrew / auto-install | 镜像内置或 auto-install | auto-install (`static-ffmpeg`) |
-| 内置 | manifest 校验 | ✅ | ✅ | ✅ |
+| 内置 | manifest 校验（HLS 模式） | ✅ | ✅ | ✅ |
 | 可选 | mediastreamvalidator | Apple HLS Tools 手动安装 | 不适用 | 不适用 |
 | 可选 | packager | 字幕 fMP4 | 同左 | 同左 |
 
@@ -23,7 +43,7 @@ MoviePilot 插件仓库。
 2. 流媒体站地址 + Admin API Key
 3. 启用插件（TMDB 留空即用 MoviePilot 自带 Key）
 
-详情页有「上手检查」清单；环境 API：`POST /plugin/CloudUploader/refresh_env` 重新检测切片环境。
+详情页有「上手检查」清单；环境 API：`POST /plugin/CloudUploader/refresh_env` 重新检测媒体处理环境。
 - 站点 Admin 配置 Telegram 上新通知后，插件上传入库（首次绑定播放源）会自动推送到频道 [@TVBot800](https://t.me/TVBot800)
 
 ## 在 MoviePilot 中安装

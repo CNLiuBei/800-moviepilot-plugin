@@ -22,5 +22,12 @@ jobs:
       - name: Validate package metadata
         run: python -m json.tool package.v2.json >/dev/null
 
+      - name: Install plugin dependencies
+        run: python -m pip install -r plugins.v2/clouduploader/requirements.txt
+
       - name: Compile CloudUploader plugin
-        run: python -m py_compile $(find plugins.v2/clouduploader -name "*.py")
+        run: python -m compileall -q plugins.v2/clouduploader
+
+      - name: Test CloudUploader plugin
+        working-directory: plugins.v2/clouduploader
+        run: python -m unittest discover -s uploader -p "test_*.py" -v

@@ -10,3 +10,9 @@ venv/
 
 # Build artifacts
 *.zip
+
+# Local Cloudflare cache
+.wrangler/
+
+# Local agent scratch
+.superpowers/
