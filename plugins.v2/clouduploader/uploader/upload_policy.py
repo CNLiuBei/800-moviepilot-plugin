@@ -25,6 +25,19 @@ def validate_upload_identity(media_type, season, episode):
     return normalized_type, normalized_season, normalized_episode, None
 
 
+def build_task_key(params: dict) -> str:
+    """Queue / success-record key: always includes media_type to avoid movie/tv id collisions."""
+    tid = params.get("tmdb_id")
+    media_type = "tv" if str(params.get("media_type") or "").strip().lower() == "tv" else "movie"
+    season = params.get("season")
+    episode = params.get("episode")
+    if tid is not None and tid != "" and season is not None and episode is not None:
+        return f"{media_type}_{tid}_S{int(season):02d}E{int(episode):02d}"
+    if tid is not None and tid != "":
+        return f"{media_type}_{tid}"
+    return str(params.get("filepath", "?"))
+
+
 def recovery_policy_from_marker(marker: dict | None) -> dict:
     """Restore upload policy fields from an R2 uploaded/ready marker."""
     data = marker if isinstance(marker, dict) else {}

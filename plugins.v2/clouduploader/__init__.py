@@ -2,7 +2,7 @@
 MoviePilot V2 插件: 云端自动上传（全合并版）
 
 下载整理完成后，在插件进程内直接完成：
-Apple HLS 切片（官方工具生成并校验）→ R2 上传 → TMDB 元数据 → 站点入库。
+默认 MP4 直传（可选 HLS 分片）→ R2 上传 → TMDB 元数据 → 站点入库。
 
 无需再单独运行上传工具服务，插件丢进 MoviePilot 即可使用。
 依赖外部二进制：ffmpeg / ffprobe（必需，全平台可 auto-install）；mediastreamvalidator 仅 macOS 可选。
@@ -26,12 +26,14 @@ from .uploader.runtime_config import settings
 from .uploader.runtime_config import ConfigError, normalize_base_url
 from .uploader.job_runner import run_job
 from .uploader.upload_policy import (
+    build_task_key,
     direct_mode_enabled,
     normalize_upload_mode,
     recovery_policy_from_marker,
     recovery_policy_from_source_type,
     validate_upload_identity,
 )
+from .uploader.upload_path_guard import assert_filepath_allowed
 from .uploader import notify as _notify_mod
 from .uploader import env as _env
 from .uploader import cf_auto as _cf_auto
@@ -51,7 +53,7 @@ class CloudUploader(_PluginBase):
     plugin_name = "云端自动上传"
     plugin_desc = "默认 MP4 直传（可选 HLS），整理完成后自动上传 R2 并入库到流媒体站。"
     plugin_icon = "upload.png"
-    plugin_version = "2.8.9"
+    plugin_version = "2.9.2"
     plugin_author = "cn"
     author_url = "https://github.com/CNLiuBei/800-moviepilot-plugin"
     plugin_config_prefix = "clouduploader_"
@@ -190,6 +192,7 @@ class CloudUploader(_PluginBase):
             tg_bot_token=config.get("tg_bot_token", ""),
             tg_chat_id=config.get("tg_chat_id", ""),
         )
+        _notify_mod.configure_notify_policy(config)
         missing = settings.validate()
         self._config_ready = not missing
         if self._enabled and missing:
@@ -251,15 +254,8 @@ class CloudUploader(_PluginBase):
 
     @staticmethod
     def _task_key(params: dict) -> str:
-        """任务唯一键：tmdb + 季集（或文件路径）。"""
-        tid = params.get("tmdb_id")
-        s = params.get("season")
-        e = params.get("episode")
-        if tid and _has_episode_numbers(s, e):
-            return f"{tid}_S{int(s):02d}E{int(e):02d}"
-        if tid:
-            return f"{tid}_movie"
-        return str(params.get("filepath", "?"))
+        """任务唯一键：media_type + tmdb + 季集（或文件路径）。"""
+        return build_task_key(params)
 
     def _record_task(self, key: str, params: dict, status: str, error: str = "", stage: str = ""):
         tasks = self._load_tasks()
@@ -576,6 +572,13 @@ class CloudUploader(_PluginBase):
                 "description": "重新探测 ffmpeg/ffprobe，必要时触发 static-ffmpeg 自动安装。",
             },
             {
+                "path": "/test_notify",
+                "endpoint": self.api_test_notify,
+                "methods": ["POST"],
+                "summary": "发送 Telegram 测试通知",
+                "description": "向已启用的 Bot Chat / 频道发送一条测试消息，用于验证 Token 与目标配置。",
+            },
+            {
                 "path": "/upload",
                 "endpoint": self.api_upload,
                 "methods": ["POST"],
@@ -609,6 +612,18 @@ class CloudUploader(_PluginBase):
             "platform": (self._env_status or {}).get("platform") or "",
         }
 
+    def api_test_notify(self) -> dict:
+        """发送 Telegram 测试通知（忽略事件开关，只看目标配置）。"""
+        _notify_mod.configure_notify_policy(self._config or {})
+        result = _notify_mod.send_test_notification()
+        return {
+            "success": bool(result.get("ok") or result.get("sent")),
+            "message": result.get("message") or "",
+            "sent": int(result.get("sent") or 0),
+            "targets": result.get("targets") or [],
+            "errors": result.get("errors") or [],
+        }
+
     def api_upload(
         self,
         filepath: str,
@@ -630,8 +645,10 @@ class CloudUploader(_PluginBase):
             return {"success": False, "message": "配置缺失: " + "、".join(settings.validate())}
 
         filepath = (filepath or "").strip()
-        if not filepath or not os.path.isfile(filepath):
-            return {"success": False, "message": f"文件不存在: {filepath or '(空)'}"}
+        allowed_path, path_error = assert_filepath_allowed(filepath, self._cleanup_roots())
+        if path_error:
+            return {"success": False, "message": path_error}
+        filepath = allowed_path
 
         try:
             tmdb_id = int(tmdb_id)
@@ -661,7 +678,8 @@ class CloudUploader(_PluginBase):
         params["direct_mp4"] = mode == "direct"
         params["skip_slice"] = mode == "direct"
         params["h264_compat"] = self._h264_compat if h264_compat is None else bool(h264_compat)
-        params["clean_after"] = self._clean_after if clean_after is None else bool(clean_after)
+        # 手动 API 默认不删源文件，避免误传任意路径后清理；显式传 clean_after 才覆盖
+        params["clean_after"] = False if clean_after is None else bool(clean_after)
         params["force_overwrite"] = False if force_overwrite is None else bool(force_overwrite)
         if resolution:
             params["resolution"] = str(resolution)
@@ -909,8 +927,11 @@ class CloudUploader(_PluginBase):
 
         if result == "queued":
             logger.info(f"[CloudUploader] 目录监控入队: {Path(filepath).name}")
+            title = "【云端上传】目录监控入队"
+            detail = Path(filepath).name
             if self._notify:
-                self._mp_notify("【云端上传】目录监控入队", Path(filepath).name)
+                self._mp_notify(title, detail)
+            _notify_mod.notify_enqueue(title, detail)
         elif result == "no_history":
             logger.warning(f"[CloudUploader] 目录监控跳过（无整理历史/TMDB）: {filepath}")
         else:
@@ -989,8 +1010,12 @@ class CloudUploader(_PluginBase):
             f"任务已成功 {skipped_success}, 已在队列 {skipped_inflight}, "
             f"上传中 {skipped_uploading}, 无整理记录 {skipped_no_history}"
         )
-        if queued > 0 and self._notify:
-            self._mp_notify("【云端上传】目录扫描补传", f"发现 {queued} 个未上传文件，已入队")
+        if queued > 0:
+            title = "【云端上传】目录扫描补传"
+            detail = f"发现 {queued} 个未上传文件，已入队"
+            if self._notify:
+                self._mp_notify(title, detail)
+            _notify_mod.notify_scan(title, detail)
 
     def _check_and_enqueue_file(self, filepath: str, tasks: dict,
                                 cleanup_roots: Optional[List[str]] = None) -> str:
@@ -1033,7 +1058,10 @@ class CloudUploader(_PluginBase):
 
         # 3b. 检查任务记录中是否已成功
         task_key = self._task_key({
-            "tmdb_id": tmdb_id, "season": season, "episode": episode,
+            "tmdb_id": tmdb_id,
+            "media_type": media_type,
+            "season": season,
+            "episode": episode,
         })
         if tasks.get(task_key, {}).get("status") == "success":
             return "success"
@@ -1294,8 +1322,27 @@ class CloudUploader(_PluginBase):
                                   _text("ffprobe_bin", "ffprobe 路径", "ffprobe", md=4),
                                   _text("mediastreamvalidator_bin", "mediastreamvalidator（macOS 可选）",
                                         "mediastreamvalidator", md=4)),
-                    _advanced_row(_text("tg_bot_token", "Telegram Bot Token", md=6, ptype="password"),
-                                  _text("tg_chat_id", "Telegram Chat ID", md=6)),
+                    _advanced_row({"component": "VCol", "props": {"cols": 12},
+                                   "content": [{"component": "VAlert", "props": {
+                                       "type": "info", "variant": "tonal", "density": "compact",
+                                       "text": ("Telegram：同一 Bot Token 可同时发到私聊/群与频道。"
+                                                "事件与字段仅控制 TG；MoviePilot 通知仍看上方「发送通知」。"
+                                                "保存后可用 POST /api/v1/plugin/CloudUploader/test_notify 测通。"),
+                                   }}]}),
+                    _advanced_row(_text("tg_bot_token", "Telegram Bot Token", md=12, ptype="password")),
+                    _advanced_row(_switch("tg_bot_enabled", "Bot 私聊/群通知", md=3),
+                                  _text("tg_chat_id", "Bot Chat ID", md=3),
+                                  _switch("tg_channel_enabled", "频道通知", md=3),
+                                  _text("tg_channel_id", "频道 ID / @username", md=3)),
+                    _advanced_row(_switch("tg_event_success", "事件·上传成功", md=2),
+                                  _switch("tg_event_failed", "事件·上传失败", md=2),
+                                  _switch("tg_event_register_failed", "事件·入库失败", md=2),
+                                  _switch("tg_event_enqueue", "事件·入队", md=3),
+                                  _switch("tg_event_scan", "事件·扫描补传", md=3)),
+                    _advanced_row(_switch("tg_field_filename", "字段·文件名", md=3),
+                                  _switch("tg_field_tmdb", "字段·TMDB", md=3),
+                                  _switch("tg_field_episode", "字段·季集", md=3),
+                                  _switch("tg_field_quality_mode", "字段·画质/模式", md=3)),
                     _row({"component": "VCol", "props": {"cols": 12},
                           "content": [{"component": "VAlert", "props": {
                               "type": "info", "variant": "tonal", "density": "compact",
@@ -1322,6 +1369,13 @@ class CloudUploader(_PluginBase):
             "ffmpeg_bin": "ffmpeg", "ffprobe_bin": "ffprobe",
             "mediastreamvalidator_bin": "mediastreamvalidator",
             "tg_bot_token": "", "tg_chat_id": "",
+            "tg_bot_enabled": True,
+            "tg_channel_enabled": False, "tg_channel_id": "",
+            "tg_event_success": True, "tg_event_failed": True,
+            "tg_event_register_failed": True,
+            "tg_event_enqueue": False, "tg_event_scan": False,
+            "tg_field_filename": True, "tg_field_tmdb": True,
+            "tg_field_episode": True, "tg_field_quality_mode": True,
         }
 
     def get_page(self) -> List[dict]:
@@ -1557,9 +1611,13 @@ class CloudUploader(_PluginBase):
             season=season,
             episode=episode,
         ))
-        if enqueued and self._notify:
+        if enqueued:
             ep_str = _episode_label(season, episode)
-            self._mp_notify("【云端上传】已入队", f"{title} {ep_str} | TMDB-{tmdb_id}")
+            notify_title = "【云端上传】已入队"
+            notify_detail = f"{title} {ep_str} | TMDB-{tmdb_id}"
+            if self._notify:
+                self._mp_notify(notify_title, notify_detail)
+            _notify_mod.notify_enqueue(notify_title, notify_detail)
 
     @staticmethod
     def _item_path(item) -> Optional[str]:

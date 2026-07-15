@@ -1,6 +1,7 @@
 import unittest
 
 from uploader.upload_policy import (
+    build_task_key,
     direct_mode_enabled,
     normalize_upload_mode,
     recovery_policy_from_marker,
@@ -53,6 +54,21 @@ class UploadPolicyTests(unittest.TestCase):
         self.assertEqual(
             {"upload_mode": "hls", "direct_mp4": False, "h264_compat": False},
             recovery_policy_from_source_type("cmaf"),
+        )
+
+    def test_task_key_includes_media_type_so_movie_and_tv_do_not_collide(self):
+        movie = build_task_key({"tmdb_id": 550, "media_type": "movie"})
+        tv = build_task_key({"tmdb_id": 550, "media_type": "tv"})
+        self.assertEqual("movie_550", movie)
+        self.assertEqual("tv_550", tv)
+        self.assertNotEqual(movie, tv)
+
+    def test_task_key_includes_media_type_for_episodes(self):
+        self.assertEqual(
+            "tv_550_S01E02",
+            build_task_key(
+                {"tmdb_id": 550, "media_type": "tv", "season": 1, "episode": 2}
+            ),
         )
 
 

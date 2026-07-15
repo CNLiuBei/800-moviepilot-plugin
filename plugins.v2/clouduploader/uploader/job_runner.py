@@ -24,9 +24,9 @@ from .env import resolve_tool
 from .parser import parse_filename
 from .slicer import apple_hls_slice, get_video_duration
 from .subtitles import resolve_subtitles_for_upload, generate_hls_subtitle_playlists
-from .tmdb import get_original_language, verify_tmdb_metadata
+from .tmdb import get_original_language, get_imdb_id, verify_tmdb_metadata
 from .register import auto_register, write_episode_nfo, write_show_nfo
-from .notify import notify_upload_success, notify_upload_failed
+from .notify import notify_upload_success, notify_upload_failed, notify_register_failed
 from .r2 import get_s3_client, upload_file_resilient, _MIME_MAP
 from .direct_media import prepare_direct_mp4
 from .upload_policy import direct_mode_enabled
@@ -109,6 +109,12 @@ def upload_directory_smart(local_dir: Path, r2_prefix: str, on_progress, cancel_
         return 0, 0
 
     existing = _list_r2_prefix(s3, r2_prefix)
+    hls_complete = "ready.json" in existing and (
+        "master.m3u8" in existing or "stream.m3u8" in existing
+    )
+    if not force_overwrite and hls_complete:
+        return 0, 0
+
     keys_to_delete = [
         f"{r2_prefix}/{rel}"
         for rel in existing.keys()
@@ -591,6 +597,7 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
         params: 任务参数 dict，至少包含 filepath, tmdb_id；可选 media_type/season/episode/
                 cmaf/clean_after/force_overwrite/skip_slice/skip_upload/skip_register/skip_metadata_check/
                 no_subtitles/retry_attempts（每阶段重试次数，默认 3）/
+                no_opensubtitles（禁用 OpenSubtitles v3 中文字幕兜底）/
                 direct_mp4（准备浏览器兼容 MP4 后直传，sourceType=mp4）
         log_fn: 日志回调 log_fn(str)，默认 print
         cancel_check: 取消检查回调 () -> bool，默认永不取消
@@ -628,8 +635,14 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
         finally:
             direct_path = None
 
-    def _fail(stage: str, error: str, r2_path=None):
+    def _fail(stage: str, error: str, r2_path=None, *, notify: bool = True):
         # 失败时清理本地切片产物，避免占盘（源文件始终保留）
+        if notify:
+            notify_upload_failed(
+                filename=Path(str(params.get("filepath") or "?")).name,
+                error=error,
+                stage=stage,
+            )
         if cleanup_on_fail and local_output and local_output.exists():
             shutil.rmtree(local_output, ignore_errors=True)
             log(f"🧹 失败清理本地切片: {local_output}")
@@ -640,7 +653,7 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
         if missing_config:
             msg = "配置缺失: " + "、".join(missing_config)
             log(f"❌ {msg}，已停止任务，避免切片后上传失败")
-            return {"status": "error", "error": msg, "r2_path": None, "stage": "precheck"}
+            return _fail("precheck", msg, notify=True)
 
         direct_mp4 = direct_mode_enabled(params)
         if direct_mp4:
@@ -654,12 +667,12 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
                 else "媒体处理环境未就绪: 未找到 ffmpeg/ffprobe"
             )
             log(f"❌ {msg}")
-            return {"status": "error", "error": msg, "r2_path": None, "stage": "precheck"}
+            return _fail("precheck", msg)
 
         filepath = params["filepath"]
         if not os.path.isfile(filepath):
             log(f"❌ 文件不存在: {filepath}")
-            return {"status": "error", "error": "文件不存在", "r2_path": None, "stage": "precheck"}
+            return _fail("precheck", "文件不存在")
 
         info = parse_filename(filepath)
         season = params.get("season") if params.get("season") is not None else info.get("season")
@@ -684,7 +697,7 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
             )
             if not ok_meta:
                 log(f"❌ {meta_err}")
-                return {"status": "error", "error": meta_err, "r2_path": None, "stage": "metadata"}
+                return _fail("metadata", meta_err)
             if resolved_type != media_type:
                 log(f"   ℹ️ 媒体类型修正: {media_type} → {resolved_type}")
                 media_type = resolved_type
@@ -717,6 +730,14 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
             elif tmdb_lang_error:
                 log(f"   ⚠️ 未能读取 TMDB 原声语言 ({tmdb_lang_error})")
 
+        imdb_id = params.get("imdb_id")
+        if not imdb_id and tmdb_id and not remote_uploaded and not params.get("no_subtitles"):
+            imdb_id, imdb_error = get_imdb_id(int(tmdb_id), media_type)
+            if imdb_id:
+                log(f"   IMDb: {imdb_id}")
+            elif imdb_error:
+                log(f"   ⚠️ 未能读取 IMDb id ({imdb_error})")
+
         if remote_uploaded:
             marker_subtitles = remote_marker.get("subtitles")
             if isinstance(marker_subtitles, list):
@@ -739,13 +760,21 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
                 local_output,
                 print_fn=log,
                 original_language=original_language,
+                imdb_id=imdb_id,
+                media_type=media_type,
+                season=int(season) if season is not None else None,
+                episode=int(episode) if episode is not None else None,
+                opensubtitles=not bool(params.get("no_opensubtitles")),
             )
             if subtitles:
                 for sub in subtitles:
-                    source = "外挂" if sub.get("source") == "external" else "内嵌"
+                    source = {
+                        "external": "外挂",
+                        "opensubtitles": "OpenSubtitles",
+                    }.get(str(sub.get("source") or ""), "内嵌")
                     log(f"   字幕 [{sub['lang']}] {sub['label']} ({source})")
             else:
-                log("   无内嵌/外挂字幕")
+                log("   无内嵌/外挂/OpenSubtitles 字幕")
 
         # ─── 切片 / 直传准备 ───
         if direct_mp4 and not remote_uploaded:
@@ -893,7 +922,7 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
             try:
                 _remote_source_type(r2_path)
             except Exception as e:
-                return {"status": "error", "error": str(e), "r2_path": r2_path, "stage": "verify"}
+                return _fail("verify", str(e), r2_path)
             upload_verified = True
         elif local_output and local_output.exists():
             try:
@@ -908,55 +937,55 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
             write_episode_nfo(int(tmdb_id), int(season), int(episode), r2_path, resolution, filepath, print_fn=log)
         write_show_nfo(int(tmdb_id), media_type, print_fn=log)
 
-        # ─── 入库（关键步骤，失败需重试，否则前端看不到该集）───
-        if not params.get("skip_register"):
-            marker_source_type = str(remote_marker.get("sourceType") or "")
-            allowed_types = {"cmaf", "hls", "mp4"}
-            source_type = marker_source_type if marker_source_type in allowed_types else "hls"
-            if direct_mp4 and not marker_source_type:
-                source_type = "mp4"
-            elif not marker_source_type:
-                if remote_uploaded:
-                    source_type = _remote_source_type(r2_path)
-                elif (local_output / "master.m3u8").exists():
+        # ─── 播放源类型 + uploaded 标记（入库成功前保留，便于对账补登）───
+        marker_source_type = str(remote_marker.get("sourceType") or "")
+        allowed_types = {"cmaf", "hls", "mp4"}
+        source_type = marker_source_type if marker_source_type in allowed_types else "hls"
+        if direct_mp4 and not marker_source_type:
+            source_type = "mp4"
+        elif not marker_source_type:
+            if remote_uploaded:
+                source_type = _remote_source_type(r2_path)
+            elif local_output and (local_output / "master.m3u8").exists():
+                source_type = "cmaf"
+            else:
+                try:
+                    s3 = get_s3_client()
+                    s3.head_object(Bucket=settings.R2_BUCKET, Key=f"{r2_path}/master.m3u8")
                     source_type = "cmaf"
-                else:
+                except Exception:
                     try:
                         s3 = get_s3_client()
-                        s3.head_object(Bucket=settings.R2_BUCKET, Key=f"{r2_path}/master.m3u8")
-                        source_type = "cmaf"
+                        s3.head_object(Bucket=settings.R2_BUCKET, Key=f"{r2_path}/video.mp4")
+                        source_type = "mp4"
                     except Exception:
-                        try:
-                            s3 = get_s3_client()
-                            s3.head_object(Bucket=settings.R2_BUCKET, Key=f"{r2_path}/video.mp4")
-                            source_type = "mp4"
-                        except Exception:
-                            source_type = "hls"
+                        source_type = "hls"
 
-            # 分集时长：优先用切片探测到的时长；若缺失且源文件还在，则补探测一次
-            duration_for_register = int(video_duration) if video_duration else None
-            if not duration_for_register and filepath and os.path.isfile(filepath):
-                duration_for_register = get_video_duration(filepath)
+        duration_for_register = int(video_duration) if video_duration else None
+        if not duration_for_register and filepath and os.path.isfile(filepath):
+            duration_for_register = get_video_duration(filepath)
 
-            if upload_verified:
-                _put_upload_marker(
-                    r2_path,
-                    "uploaded",
-                    _upload_marker_payload(
-                        filepath, source_type, resolution or "原画",
-                        subtitles, duration_for_register,
-                        upload_mode=params.get("upload_mode") or ("direct" if source_type == "mp4" else "hls"),
-                        h264_compat=bool(params.get("h264_compat")),
-                        video_codec=media_meta.get("videoCodec"),
-                        width=media_meta.get("width"),
-                        height=media_meta.get("height"),
-                        bitrate=media_meta.get("bitrate"),
-                        frame_rate=media_meta.get("frameRate"),
-                    ),
-                    log,
-                )
-                _delete_upload_marker(r2_path, "uploading", log)
+        if upload_verified:
+            _put_upload_marker(
+                r2_path,
+                "uploaded",
+                _upload_marker_payload(
+                    filepath, source_type, resolution or "原画",
+                    subtitles, duration_for_register,
+                    upload_mode=params.get("upload_mode") or ("direct" if source_type == "mp4" else "hls"),
+                    h264_compat=bool(params.get("h264_compat")),
+                    video_codec=media_meta.get("videoCodec"),
+                    width=media_meta.get("width"),
+                    height=media_meta.get("height"),
+                    bitrate=media_meta.get("bitrate"),
+                    frame_rate=media_meta.get("frameRate"),
+                ),
+                log,
+            )
+            _delete_upload_marker(r2_path, "uploading", log)
 
+        # ─── 入库（关键步骤，失败需重试，否则前端看不到该集）───
+        if not params.get("skip_register"):
             register_error = [""]
 
             def _do_register():
@@ -978,36 +1007,42 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
                 # 切片和上传已成功，仅入库失败：保留 R2 数据，标记失败便于对账补入库
                 err_detail = register_error[0] or "未知原因"
                 log(f"❌ 入库失败（R2 数据已上传，将由对账兜底重试）— {err_detail}")
+                notify_register_failed(
+                    filename=Path(filepath).name,
+                    error=err_detail,
+                    r2_path=r2_path,
+                )
                 return {"status": "error", "error": f"站点入库失败: {err_detail}", "r2_path": r2_path, "stage": "register"}
 
-        if upload_verified:
-            if not params.get("skip_register"):
-                ready_source_type = source_type
+            if upload_verified:
+                ready_payload = {
+                    "file": Path(filepath).name,
+                    "sourceType": source_type,
+                    "uploadMode": params.get("upload_mode") or ("direct" if direct_mp4 else "hls"),
+                    "h264Compat": bool(params.get("h264_compat")),
+                }
+                for key in ("videoCodec", "width", "height", "bitrate", "frameRate"):
+                    if media_meta.get(key) is not None:
+                        ready_payload[key] = media_meta[key]
+                _put_upload_marker(r2_path, "ready", ready_payload, log)
+                _delete_upload_marker(r2_path, "uploaded", log)
+                _delete_upload_marker(r2_path, "uploading", log)
             else:
-                ready_source_type = (
-                    str(remote_marker.get("sourceType") or "")
-                    or ("mp4" if direct_mp4 else "hls")
-                )
-            ready_payload = {
-                "file": Path(filepath).name,
-                "sourceType": ready_source_type,
-                "uploadMode": params.get("upload_mode") or ("direct" if direct_mp4 else "hls"),
-                "h264Compat": bool(params.get("h264_compat")),
-            }
-            for key in ("videoCodec", "width", "height", "bitrate", "frameRate"):
-                if media_meta.get(key) is not None:
-                    ready_payload[key] = media_meta[key]
-            _put_upload_marker(r2_path, "ready", ready_payload, log)
-            _delete_upload_marker(r2_path, "uploaded", log)
-            _delete_upload_marker(r2_path, "uploading", log)
+                log("   ⚠️ 未执行上传校验，跳过 ready.json 标记")
+        elif upload_verified:
+            log("   ⏭ skip_register：保留 uploaded 标记，不写 ready.json")
         else:
             log("   ⚠️ 未执行上传校验，跳过 ready.json 标记")
 
         log("━━━ 完成 ━━━")
         notify_upload_success(
-            filename=Path(filepath).name, tmdb_id=int(tmdb_id),
+            filename=Path(filepath).name,
+            tmdb_id=int(tmdb_id),
             season=int(season) if season is not None else None,
-            episode=int(episode) if episode is not None else None, r2_path=r2_path,
+            episode=int(episode) if episode is not None else None,
+            r2_path=r2_path,
+            quality=resolution or "",
+            upload_mode=params.get("upload_mode") or ("direct" if direct_mp4 else "hls"),
         )
 
         # 清理本地切片
@@ -1035,7 +1070,11 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
     except Exception as e:
         log(f"❌ 异常: {e}")
         log(traceback.format_exc())
-        notify_upload_failed(filename=Path(params.get("filepath", "?")).name, error=str(e))
+        notify_upload_failed(
+            filename=Path(params.get("filepath", "?")).name,
+            error=str(e),
+            stage="exception",
+        )
         if cleanup_on_fail and local_output and local_output.exists():
             shutil.rmtree(local_output, ignore_errors=True)
             log(f"🧹 异常清理本地切片: {local_output}")

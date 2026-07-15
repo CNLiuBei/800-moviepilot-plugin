@@ -4,7 +4,12 @@ from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from uploader.job_runner import _remote_source_type, run_job, upload_mp4_direct
+from uploader.job_runner import (
+    _remote_source_type,
+    run_job,
+    upload_directory_smart,
+    upload_mp4_direct,
+)
 
 
 class DirectUploadTests(unittest.TestCase):
@@ -365,7 +370,7 @@ class DirectRunJobTests(unittest.TestCase):
     def test_direct_mode_requires_both_ffmpeg_and_ffprobe(self):
         with patch("uploader.job_runner.settings.validate", return_value=[]), patch(
             "uploader.job_runner.resolve_tool", return_value=None
-        ):
+        ), patch("uploader.job_runner.notify_upload_failed") as notify_failed:
             result = run_job(self._params())
 
         self.assertEqual("precheck", result["stage"])
@@ -373,6 +378,8 @@ class DirectRunJobTests(unittest.TestCase):
             "直传环境未就绪: 重封装需要 ffmpeg/ffprobe",
             result["error"],
         )
+        notify_failed.assert_called_once()
+        self.assertEqual("precheck", notify_failed.call_args.kwargs.get("stage"))
 
     def test_exhausted_upload_failure_cleans_prepared_output(self):
         result, _logs, prepared_path, upload_mock = self._run_prepared_job(
@@ -462,6 +469,117 @@ class DirectRunJobTests(unittest.TestCase):
                 result["error"],
             )
             self.assertEqual(2, resolve_mock.call_count)
+
+    def test_skip_register_does_not_write_ready_marker(self):
+        marker_calls = []
+
+        def capture_marker(r2_path, status, payload=None, log=print):
+            del r2_path, payload, log
+            marker_calls.append(status)
+
+        logs = []
+        prepared_path = self.output_root / "tmdb/movie/1/video.mp4"
+
+        def prepare(_source, output, **_kwargs):
+            output.write_bytes(b"prepared-mp4")
+            return {
+                "path": str(output),
+                "duration": 12.5,
+                "videoCopied": True,
+                "audioCopied": True,
+            }
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("uploader.job_runner.settings.validate", return_value=[])
+            )
+            stack.enter_context(
+                patch("uploader.job_runner.settings.HLS_OUTPUT_DIR", self.output_root)
+            )
+            stack.enter_context(
+                patch("uploader.job_runner.resolve_tool", return_value="/tool")
+            )
+            stack.enter_context(
+                patch("uploader.job_runner.prepare_direct_mp4", side_effect=prepare)
+            )
+            stack.enter_context(
+                patch("uploader.job_runner.upload_mp4_direct", return_value=(1, 0))
+            )
+            stack.enter_context(patch("uploader.job_runner.write_show_nfo"))
+            stack.enter_context(patch("uploader.job_runner.notify_upload_success"))
+            stack.enter_context(
+                patch(
+                    "uploader.job_runner._put_upload_marker",
+                    side_effect=capture_marker,
+                )
+            )
+            stack.enter_context(patch("uploader.job_runner._delete_upload_marker"))
+            result = run_job(self._params(skip_register=True), log_fn=logs.append)
+
+        self.assertEqual("success", result["status"])
+        self.assertIn("uploaded", marker_calls)
+        self.assertNotIn("ready", marker_calls)
+        self.assertFalse(prepared_path.exists())
+
+
+class HlsDirectoryUploadTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.local = Path(self.temp_dir.name) / "hls"
+        self.local.mkdir()
+        (self.local / "master.m3u8").write_text("#EXTM3U\n")
+        (self.local / "seg.m4s").write_bytes(b"seg")
+        self.progress = MagicMock()
+        self.s3 = MagicMock()
+        self.s3.delete_objects.return_value = {}
+        self.client_patcher = patch(
+            "uploader.job_runner.get_s3_client", return_value=self.s3
+        )
+        self.list_patcher = patch(
+            "uploader.job_runner._list_r2_prefix", return_value={}
+        )
+        self.client_patcher.start()
+        self.list_mock = self.list_patcher.start()
+        self.addCleanup(patch.stopall)
+
+    def test_force_overwrite_false_keeps_ready_hls_prefix(self):
+        self.list_mock.return_value = {
+            "ready.json": 20,
+            "master.m3u8": 40,
+            "seg.m4s": 10,
+        }
+
+        result = upload_directory_smart(
+            self.local,
+            "tmdb/movie/1",
+            self.progress,
+            lambda: False,
+            force_overwrite=False,
+        )
+
+        self.assertEqual((0, 0), result)
+        self.s3.delete_objects.assert_not_called()
+        self.s3.upload_file.assert_not_called()
+
+    def test_force_overwrite_true_replaces_ready_hls_prefix(self):
+        self.list_mock.return_value = {
+            "ready.json": 20,
+            "master.m3u8": 40,
+            "seg.m4s": 10,
+        }
+
+        result = upload_directory_smart(
+            self.local,
+            "tmdb/movie/1",
+            self.progress,
+            lambda: False,
+            force_overwrite=True,
+        )
+
+        self.assertEqual((2, 3), result)
+        self.s3.delete_objects.assert_called()
+        self.assertEqual(2, self.s3.upload_file.call_count)
 
 
 if __name__ == "__main__":

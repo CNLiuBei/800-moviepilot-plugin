@@ -739,10 +739,16 @@ def resolve_subtitles_for_upload(
     output_dir: Path,
     print_fn=None,
     original_language: str | None = None,
+    imdb_id: str | None = None,
+    media_type: str | None = None,
+    season: int | None = None,
+    episode: int | None = None,
+    opensubtitles: bool = True,
 ) -> list[dict]:
     """
     解析上传任务字幕：优先内嵌；内嵌无中文时回退同目录外挂字幕。
     若内嵌与外挂均含中文，仅保留内嵌（取其一，避免重复轨）。
+    仍无中文时，按 IMDb 走 OpenSubtitles v3 拉取并写成 VTT 一并上传。
     """
     if print_fn is None:
         print_fn = print
@@ -764,16 +770,47 @@ def resolve_subtitles_for_upload(
         original_language=original_language,
     )
     if not external:
-        return embedded
+        result = list(embedded)
+    elif not embedded:
+        result = list(external)
+    else:
+        merged = list(embedded)
+        existing_categories = {sub.get("category") for sub in merged}
+        for sub in external:
+            category = sub.get("category")
+            if category in _CHINESE_SUB_CATEGORIES and category not in existing_categories:
+                merged.append(sub)
+                existing_categories.add(category)
+        result = merged
 
-    if not embedded:
-        return external
+    if _has_chinese_subtitle(result):
+        return result
 
-    merged = list(embedded)
+    if not opensubtitles:
+        return result
+
+    from .opensubtitles import resolve_opensubtitles_for_upload
+
+    print_fn("   无中文字幕，尝试 OpenSubtitles v3…")
+    remote = resolve_opensubtitles_for_upload(
+        output_dir,
+        imdb_id=imdb_id,
+        media_type=media_type or "movie",
+        season=season,
+        episode=episode,
+        print_fn=print_fn,
+    )
+    if not remote:
+        return result
+
+    if not result:
+        return remote
+
+    merged = list(result)
     existing_categories = {sub.get("category") for sub in merged}
-    for sub in external:
+    for sub in remote:
         category = sub.get("category")
-        if category in _CHINESE_SUB_CATEGORIES and category not in existing_categories:
+        if category and category not in existing_categories:
             merged.append(sub)
             existing_categories.add(category)
     return merged

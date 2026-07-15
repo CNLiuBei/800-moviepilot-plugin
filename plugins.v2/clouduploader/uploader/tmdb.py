@@ -98,3 +98,29 @@ def get_original_language(tmdb_id: int, media_type: str = "tv") -> tuple[str | N
         return None, "TMDB 响应缺少 original_language"
     normalized = str(lang).strip().lower()
     return (normalized or None), None
+
+
+def get_imdb_id(tmdb_id: int, media_type: str = "movie") -> tuple[str | None, str | None]:
+    """读取 TMDB external_ids.imdb_id（tt…）。
+
+    Returns:
+        (imdb_id, error_message)
+    """
+    kind = (media_type or "movie").strip().lower()
+    if kind not in ("movie", "tv"):
+        kind = "movie"
+    try:
+        data = tmdb_get_json(f"/{kind}/{int(tmdb_id)}/external_ids", timeout=10) or {}
+    except Exception as exc:
+        return None, str(exc)
+    imdb = str(data.get("imdb_id") or "").strip()
+    if not imdb.startswith("tt"):
+        # 电影详情偶发直接带 imdb_id
+        try:
+            detail = tmdb_get_json(f"/{kind}/{int(tmdb_id)}", timeout=10) or {}
+        except Exception as exc:
+            return None, str(exc)
+        imdb = str(detail.get("imdb_id") or "").strip()
+    if not imdb.startswith("tt"):
+        return None, "TMDB 未返回 imdb_id"
+    return imdb, None
