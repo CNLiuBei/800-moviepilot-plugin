@@ -53,7 +53,7 @@ class CloudUploader(_PluginBase):
     plugin_name = "云端自动上传"
     plugin_desc = "默认 MP4 直传（可选 HLS），整理完成后自动上传 R2 并入库到流媒体站。"
     plugin_icon = "upload.png"
-    plugin_version = "2.9.2"
+    plugin_version = "2.9.6"
     plugin_author = "cn"
     author_url = "https://github.com/CNLiuBei/800-moviepilot-plugin"
     plugin_config_prefix = "clouduploader_"
@@ -1325,20 +1325,19 @@ class CloudUploader(_PluginBase):
                     _advanced_row({"component": "VCol", "props": {"cols": 12},
                                    "content": [{"component": "VAlert", "props": {
                                        "type": "info", "variant": "tonal", "density": "compact",
-                                       "text": ("Telegram：同一 Bot Token 可同时发到私聊/群与频道。"
-                                                "事件与字段仅控制 TG；MoviePilot 通知仍看上方「发送通知」。"
+                                       "text": ("Telegram：Bot 私聊按下方事件推送；频道/群只推「新片入库成功」。"
                                                 "保存后可用 POST /api/v1/plugin/CloudUploader/test_notify 测通。"),
                                    }}]}),
                     _advanced_row(_text("tg_bot_token", "Telegram Bot Token", md=12, ptype="password")),
-                    _advanced_row(_switch("tg_bot_enabled", "Bot 私聊/群通知", md=3),
+                    _advanced_row(_switch("tg_bot_enabled", "Bot 私聊通知", md=3),
                                   _text("tg_chat_id", "Bot Chat ID", md=3),
-                                  _switch("tg_channel_enabled", "频道通知", md=3),
-                                  _text("tg_channel_id", "频道 ID / @username", md=3)),
-                    _advanced_row(_switch("tg_event_success", "事件·上传成功", md=2),
-                                  _switch("tg_event_failed", "事件·上传失败", md=2),
-                                  _switch("tg_event_register_failed", "事件·入库失败", md=2),
-                                  _switch("tg_event_enqueue", "事件·入队", md=3),
-                                  _switch("tg_event_scan", "事件·扫描补传", md=3)),
+                                  _switch("tg_channel_enabled", "频道/群·仅入库", md=3),
+                                  _text("tg_channel_id", "频道/群 ID", md=3)),
+                    _advanced_row(_switch("tg_event_success", "Bot·上传成功", md=2),
+                                  _switch("tg_event_failed", "Bot·上传失败", md=2),
+                                  _switch("tg_event_register_failed", "Bot·入库失败", md=2),
+                                  _switch("tg_event_enqueue", "Bot·入队", md=3),
+                                  _switch("tg_event_scan", "Bot·扫描补传", md=3)),
                     _advanced_row(_switch("tg_field_filename", "字段·文件名", md=3),
                                   _switch("tg_field_tmdb", "字段·TMDB", md=3),
                                   _switch("tg_field_episode", "字段·季集", md=3),

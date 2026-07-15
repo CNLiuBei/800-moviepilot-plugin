@@ -10,6 +10,7 @@ from uploader.job_runner import (
     upload_directory_smart,
     upload_mp4_direct,
 )
+from uploader.runtime_config import settings
 
 
 class DirectUploadTests(unittest.TestCase):
@@ -35,8 +36,21 @@ class DirectUploadTests(unittest.TestCase):
         self.list_patcher = patch(
             "uploader.job_runner._list_r2_prefix", return_value={}
         )
+        self.web_play_patcher = patch(
+            "uploader.job_runner.verify_remote_mp4_web_playable",
+            return_value={
+                "formatName": "mov,mp4,m4a,3gp,3g2,mj2",
+                "videoCodec": "h264",
+                "videoCodecTag": "avc1",
+                "audioCodec": "aac",
+                "width": 1920,
+                "height": 1080,
+                "duration": 60.0,
+            },
+        )
         self.client_patcher.start()
         self.list_mock = self.list_patcher.start()
+        self.web_play_mock = self.web_play_patcher.start()
         self.addCleanup(patch.stopall)
 
     def _upload_file(self, local_path, _bucket, key, ExtraArgs=None, Callback=None, Config=None):
@@ -68,6 +82,7 @@ class DirectUploadTests(unittest.TestCase):
         self.assertEqual((0, 0), result)
         self.s3.delete_objects.assert_not_called()
         self.s3.upload_file.assert_not_called()
+        self.web_play_mock.assert_not_called()
 
     def test_force_overwrite_false_replaces_incomplete_prefix(self):
         self.list_mock.return_value = {"video.mp4": 100, "stale.vtt": 5}
@@ -89,6 +104,9 @@ class DirectUploadTests(unittest.TestCase):
                 "tmdb/movie/1/stale.vtt",
             },
             {item["Key"] for item in deleted},
+        )
+        self.web_play_mock.assert_called_once_with(
+            self.s3, settings.R2_BUCKET, "tmdb/movie/1/video.mp4"
         )
 
     def test_force_overwrite_true_replaces_ready_prefix(self):
@@ -310,6 +328,8 @@ class DirectRunJobTests(unittest.TestCase):
             )
             stack.enter_context(patch("uploader.job_runner.notify_upload_success"))
             stack.enter_context(patch("uploader.job_runner.notify_upload_failed"))
+            stack.enter_context(patch("uploader.job_runner.notify_register_success"))
+            stack.enter_context(patch("uploader.job_runner.notify_register_failed"))
             stack.enter_context(patch("uploader.job_runner._put_upload_marker"))
             stack.enter_context(patch("uploader.job_runner._delete_upload_marker"))
             stack.enter_context(patch("uploader.job_runner.time.sleep"))
@@ -351,6 +371,8 @@ class DirectRunJobTests(unittest.TestCase):
             "uploader.job_runner.write_show_nfo"
         ), patch(
             "uploader.job_runner.notify_upload_success"
+        ), patch(
+            "uploader.job_runner.notify_register_success"
         ), patch(
             "uploader.job_runner._put_upload_marker"
         ), patch(
@@ -507,6 +529,7 @@ class DirectRunJobTests(unittest.TestCase):
             )
             stack.enter_context(patch("uploader.job_runner.write_show_nfo"))
             stack.enter_context(patch("uploader.job_runner.notify_upload_success"))
+            stack.enter_context(patch("uploader.job_runner.notify_register_success"))
             stack.enter_context(
                 patch(
                     "uploader.job_runner._put_upload_marker",

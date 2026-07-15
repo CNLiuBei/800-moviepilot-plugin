@@ -9,6 +9,7 @@ from pathlib import Path
 from .env import resolve_tool
 from .runtime_config import settings
 from .slicer import probe_audio_streams, probe_video_info, select_audio_streams
+from .web_playback_check import assert_web_playable
 
 _BROWSER_SAFE_AUDIO_CODECS = frozenset({"aac", "mp4a"})
 
@@ -39,7 +40,8 @@ def probe_direct_media(input_path: str, ffprobe_bin: str | None = None) -> dict:
                 ffprobe, "-v", "error",
                 "-show_entries",
                 "format=format_name,duration,bit_rate:"
-                "stream=codec_type,codec_name,width,height,avg_frame_rate,r_frame_rate",
+                "stream=codec_type,codec_name,codec_tag_string,"
+                "width,height,avg_frame_rate,r_frame_rate",
                 "-of", "json", input_path,
             ],
             capture_output=True,
@@ -75,6 +77,7 @@ def probe_direct_media(input_path: str, ffprobe_bin: str | None = None) -> dict:
     return {
         "formatName": str(media_format.get("format_name") or ""),
         "videoCodec": str(video.get("codec_name") or "").lower(),
+        "videoCodecTag": str(video.get("codec_tag_string") or "").lower(),
         "audioCodec": str(audio.get("codec_name") or "").lower(),
         "width": _as_int(video.get("width")),
         "height": _as_int(video.get("height")),
@@ -182,9 +185,14 @@ def prepare_direct_mp4(
     if not verified["videoCodec"] or not verified["audioCodec"]:
         _remove_partial_output(output_path)
         raise RuntimeError("直传输出验证失败：缺少视频或音频轨")
+    try:
+        assert_web_playable(verified, source="直传输出")
+    except RuntimeError:
+        _remove_partial_output(output_path)
+        raise
 
     print_fn(
-        f"   ✅ 直传 MP4: 视频 {verified['videoCodec']} "
+        f"   ✅ 直传 MP4 (Web 可播): 视频 {verified['videoCodec']} "
         f"{'copy' if video_copied else '→ h264'} + 音频 "
         f"{verified['audioCodec']} {'copy' if audio_copied else '→ AAC-LC'}"
     )

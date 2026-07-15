@@ -26,10 +26,16 @@ from .slicer import apple_hls_slice, get_video_duration
 from .subtitles import resolve_subtitles_for_upload, generate_hls_subtitle_playlists
 from .tmdb import get_original_language, get_imdb_id, verify_tmdb_metadata
 from .register import auto_register, write_episode_nfo, write_show_nfo
-from .notify import notify_upload_success, notify_upload_failed, notify_register_failed
+from .notify import (
+    notify_upload_success,
+    notify_upload_failed,
+    notify_register_failed,
+    notify_register_success,
+)
 from .r2 import get_s3_client, upload_file_resilient, _MIME_MAP
 from .direct_media import prepare_direct_mp4
 from .upload_policy import direct_mode_enabled
+from .web_playback_check import verify_remote_mp4_web_playable
 
 
 # ─── 重试工具 ───
@@ -402,6 +408,14 @@ def upload_mp4_direct(
             raise RuntimeError(
                 f"R2 旁路文件 {rel_key} Content-Type 不是 {expected_type}"
             )
+
+    # Size/type alone is not enough: confirm the remote object is web-playable.
+    video_key = f"{r2_prefix}/video.mp4"
+    probe = verify_remote_mp4_web_playable(s3, settings.R2_BUCKET, video_key)
+    print(
+        f"[upload] Web 可播校验通过: {probe.get('videoCodec')}/"
+        f"{probe.get('audioCodec')} {probe.get('width')}x{probe.get('height')}"
+    )
     return uploaded, deleted
 
 
@@ -916,7 +930,7 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
             if not ok_up:
                 return _fail("upload", "R2 上传失败", r2_path)
             log(f"   ✅ 覆盖上传 {up_res['uploaded']} 个文件，清理旧文件 {up_res['deleted']} 个，{time.time()-start:.1f}s")
-            log("   ✅ R2 远端校验通过，继续入库")
+            log("   ✅ R2 Web 可播校验通过，继续入库")
             upload_verified = True
         elif remote_uploaded:
             try:
@@ -1013,6 +1027,17 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
                     r2_path=r2_path,
                 )
                 return {"status": "error", "error": f"站点入库失败: {err_detail}", "r2_path": r2_path, "stage": "register"}
+
+            notify_register_success(
+                filename=Path(filepath).name,
+                tmdb_id=int(tmdb_id),
+                media_type=media_type,
+                season=int(season) if season is not None else None,
+                episode=int(episode) if episode is not None else None,
+                quality=resolution or "",
+                upload_mode=params.get("upload_mode") or ("direct" if direct_mp4 else "hls"),
+                duration_secs=duration_for_register,
+            )
 
             if upload_verified:
                 ready_payload = {

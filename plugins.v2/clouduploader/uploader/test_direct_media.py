@@ -66,6 +66,7 @@ class DirectMediaTests(unittest.TestCase):
             return_value={
                 "formatName": "mov,mp4,m4a,3gp,3g2,mj2",
                 "videoCodec": "hevc",
+                "videoCodecTag": "hvc1",
                 "width": 1920,
                 "height": 1080,
                 "bitrate": 4_000_000,

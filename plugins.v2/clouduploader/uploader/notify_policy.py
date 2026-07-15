@@ -4,6 +4,7 @@ from __future__ import annotations
 EVENT_SUCCESS = "success"
 EVENT_FAILED = "failed"
 EVENT_REGISTER_FAILED = "register_failed"
+EVENT_REGISTER_SUCCESS = "register_success"
 EVENT_ENQUEUE = "enqueue"
 EVENT_SCAN = "scan"
 
@@ -11,6 +12,8 @@ _EVENT_DEFAULTS = {
     EVENT_SUCCESS: True,
     EVENT_FAILED: True,
     EVENT_REGISTER_FAILED: True,
+    # Bot 默认不另推入库成功（与「上传完成」重复）；频道/群固定只收此事件
+    EVENT_REGISTER_SUCCESS: False,
     EVENT_ENQUEUE: False,
     EVENT_SCAN: False,
 }
@@ -77,7 +80,7 @@ def event_enabled(policy: dict, event: str) -> bool:
 
 
 def resolve_tg_chat_ids(policy: dict) -> list[str]:
-    """Return destination chat ids when token is present and targets are enabled."""
+    """All enabled targets (for test_notify)."""
     if not str(policy.get("tg_bot_token") or "").strip():
         return []
     targets: list[str] = []
@@ -86,6 +89,29 @@ def resolve_tg_chat_ids(policy: dict) -> list[str]:
         targets.append(bot_chat)
     channel = str(policy.get("tg_channel_id") or "").strip()
     if policy.get("tg_channel_enabled") and channel and channel not in targets:
+        targets.append(channel)
+    return targets
+
+
+def resolve_tg_targets_for_event(policy: dict, event: str) -> list[str]:
+    """
+    Route Telegram by destination:
+    - Bot 私聊：受 tg_event_* 开关控制
+    - 频道/群（tg_channel_*）：仅新片入库成功 (register_success)
+    """
+    if not str(policy.get("tg_bot_token") or "").strip():
+        return []
+    targets: list[str] = []
+    bot_chat = str(policy.get("tg_bot_chat_id") or "").strip()
+    if policy.get("tg_bot_enabled", True) and bot_chat and event_enabled(policy, event):
+        targets.append(bot_chat)
+    channel = str(policy.get("tg_channel_id") or "").strip()
+    if (
+        policy.get("tg_channel_enabled")
+        and channel
+        and event == EVENT_REGISTER_SUCCESS
+        and channel not in targets
+    ):
         targets.append(channel)
     return targets
 
