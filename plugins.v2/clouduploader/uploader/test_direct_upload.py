@@ -269,6 +269,7 @@ class DirectRunJobTests(unittest.TestCase):
             "no_subtitles": True,
             "original_language": "en",
             "retry_attempts": 1,
+            "resolution": "1080p",
         }
         params.update(overrides)
         return params
@@ -283,7 +284,7 @@ class DirectRunJobTests(unittest.TestCase):
         register_result=(True, ""),
     ):
         logs = []
-        prepared_path = self.output_root / "tmdb/movie/1/video.mp4"
+        prepared_path = self.output_root / "tmdb/movie/1/1080p/video.mp4"
 
         def prepare(_source, output, **_kwargs):
             output.write_bytes(b"prepared-mp4")
@@ -300,6 +301,12 @@ class DirectRunJobTests(unittest.TestCase):
             else (lambda: False)
         )
         with ExitStack() as stack:
+            stack.enter_context(
+                patch(
+                    "uploader.slicer.probe_video_info",
+                    return_value={"width": 1920, "height": 1080},
+                )
+            )
             stack.enter_context(
                 patch("uploader.job_runner.settings.validate", return_value=[])
             )
@@ -346,7 +353,7 @@ class DirectRunJobTests(unittest.TestCase):
 
     def test_direct_job_uploads_prepared_output_and_always_cleans_it(self):
         logs = []
-        prepared_path = self.output_root / "tmdb/movie/1/video.mp4"
+        prepared_path = self.output_root / "tmdb/movie/1/1080p/video.mp4"
 
         def prepare(_source, output, **_kwargs):
             output.write_bytes(b"prepared-mp4")
@@ -357,7 +364,10 @@ class DirectRunJobTests(unittest.TestCase):
                 "audioCopied": False,
             }
 
-        with patch("uploader.job_runner.settings.validate", return_value=[]), patch(
+        with patch(
+            "uploader.slicer.probe_video_info",
+            return_value={"width": 1920, "height": 1080},
+        ), patch("uploader.job_runner.settings.validate", return_value=[]), patch(
             "uploader.job_runner.settings.HLS_OUTPUT_DIR", self.output_root
         ), patch(
             "uploader.job_runner.resolve_tool", return_value="/tool"
@@ -500,7 +510,7 @@ class DirectRunJobTests(unittest.TestCase):
             marker_calls.append(status)
 
         logs = []
-        prepared_path = self.output_root / "tmdb/movie/1/video.mp4"
+        prepared_path = self.output_root / "tmdb/movie/1/1080p/video.mp4"
 
         def prepare(_source, output, **_kwargs):
             output.write_bytes(b"prepared-mp4")

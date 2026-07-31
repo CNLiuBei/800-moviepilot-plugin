@@ -411,14 +411,17 @@ def _sync_play_source(
     duration_secs: int | None,
     print_fn,
 ) -> tuple[bool, str]:
-    """按 TMDB 身份绑定播放源。返回 (ok, error_msg)。"""
+    """按 TMDB 身份绑定播放源（同分辨率槽位替换）。返回 (ok, error_msg)。"""
+    from .resolution_key import format_source_label, normalize_quality_key
+
+    quality_key = normalize_quality_key(quality)
     payload = {
         "tmdbId": tmdb_id,
         "mediaType": media_type,
-        "label": f"原画 {quality}" if quality else "原画",
+        "label": format_source_label(quality_key),
         "sourceType": source_type,
         "url": play_url,
-        "quality": quality or "原画",
+        "quality": quality_key,
         "sortOrder": 0,
         "replace": True,
     }

@@ -699,8 +699,24 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
 
         log(f"📄 文件: {Path(filepath).name}")
         log(f"   TMDB ID: {tmdb_id} | {media_type} | {episode_label} | {resolution or '?'}")
+
+        # 优先用 ffprobe 真实宽度定档（超宽按宽边）
+        try:
+            from .resolution_key import quality_key_from_width
+            from .slicer import probe_video_info
+            probed = probe_video_info(filepath)
+            probed_w = int(probed.get("width") or 0)
+            if probed_w > 0:
+                width_key = quality_key_from_width(probed_w)
+                if width_key != "未知":
+                    log(f"   探测宽度: {probed_w} → {width_key}"
+                        + (f"（覆盖文件名 {resolution}）" if resolution and resolution != width_key else ""))
+                    resolution = width_key
+        except Exception as probe_err:
+            log(f"   ⚠️ 宽度探测失败，回退文件名/参数: {probe_err}")
+
         if params.get("force_overwrite"):
-            log("⚠️ 强制覆盖模式: 将删除 R2 旧数据并重新上传")
+            log("⚠️ 强制覆盖模式: 将删除当前分辨率目录旧数据并重新上传")
 
         if not params.get("skip_metadata_check"):
             if cancel_check():
@@ -721,6 +737,10 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
             r2_path = f"tmdb/{media_type}/{tmdb_id}/season/{int(season)}/episode/{int(episode)}"
         else:
             r2_path = f"tmdb/{media_type}/{tmdb_id}"
+        from .resolution_key import append_resolution_to_r2_path
+
+        r2_path, quality_key = append_resolution_to_r2_path(r2_path, resolution)
+        resolution = quality_key
         local_output = settings.HLS_OUTPUT_DIR / r2_path
         log(f"📂 R2 路径: {r2_path}/")
 
@@ -914,9 +934,9 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
                     _do_direct_upload, attempts=attempts, base_delay=5.0,
                     log=log, what="R2 直传", cancel_check=cancel_check)
             else:
-                log("📤 覆盖上传 R2 (清理旧文件)...")
+                log("📤 覆盖当前分辨率目录 (清理同档旧文件)...")
 
-                # 覆盖上传：每次先清理目标前缀旧对象，再完整上传本地目录，避免 R2 残留多余文件。
+                # 覆盖当前分辨率前缀：先清理该档旧对象，再完整上传，不影响其它分辨率目录。
                 def _do_upload():
                     up, deleted = upload_directory_smart(
                         local_output, r2_path, upload_progress, cancel_check, force_overwrite=force_overwrite)
@@ -929,7 +949,7 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
                 return {"status": "cancelled", "error": None, "r2_path": r2_path}
             if not ok_up:
                 return _fail("upload", "R2 上传失败", r2_path)
-            log(f"   ✅ 覆盖上传 {up_res['uploaded']} 个文件，清理旧文件 {up_res['deleted']} 个，{time.time()-start:.1f}s")
+            log(f"   ✅ 覆盖当前分辨率目录 {up_res['uploaded']} 个文件，清理旧文件 {up_res['deleted']} 个，{time.time()-start:.1f}s")
             log("   ✅ R2 Web 可播校验通过，继续入库")
             upload_verified = True
         elif remote_uploaded:
@@ -978,6 +998,17 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
         duration_for_register = int(video_duration) if video_duration else None
         if not duration_for_register and filepath and os.path.isfile(filepath):
             duration_for_register = get_video_duration(filepath)
+
+        # 入库前若已有探测宽度，再次对齐档位
+        try:
+            from .resolution_key import quality_key_from_width
+            meta_w = int((media_meta or {}).get("width") or 0)
+            if meta_w > 0:
+                width_key = quality_key_from_width(meta_w)
+                if width_key != "未知":
+                    resolution = width_key
+        except Exception:
+            pass
 
         if upload_verified:
             _put_upload_marker(

@@ -53,7 +53,7 @@ class CloudUploader(_PluginBase):
     plugin_name = "云端自动上传"
     plugin_desc = "默认 MP4 直传（可选 HLS），整理完成后自动上传 R2 并入库到流媒体站。"
     plugin_icon = "upload.png"
-    plugin_version = "2.9.6"
+    plugin_version = "2.9.7"
     plugin_author = "cn"
     author_url = "https://github.com/CNLiuBei/800-moviepilot-plugin"
     plugin_config_prefix = "clouduploader_"
@@ -82,8 +82,9 @@ class CloudUploader(_PluginBase):
     # CF Token 自动推导出的 R2 配置（供详情页展示）
     _cf_derived: dict = {}
 
-    # 任务队列（单后台线程顺序执行，避免并发切片占满资源）
-    _task_queue: Optional["queue.Queue"] = None
+    # 任务队列（单后台线程顺序执行，避免并发切片占满资源；按季集号排序）
+    _task_queue: Optional["queue.PriorityQueue"] = None
+    _enqueue_counter = 0  # 同优先级时保持入队顺序
     _worker: Optional[threading.Thread] = None
     _worker_stop = False
     _stats = {"queued": 0, "running": 0, "success": 0, "error": 0}
@@ -257,6 +258,16 @@ class CloudUploader(_PluginBase):
         """任务唯一键：media_type + tmdb + 季集（或文件路径）。"""
         return build_task_key(params)
 
+    @staticmethod
+    def _sort_key(params: dict) -> tuple:
+        """优先级排序键：按 (season, episode) 升序，电影或缺失值排最后。"""
+        season = params.get("season")
+        episode = params.get("episode")
+        try:
+            return (int(season), int(episode))
+        except (TypeError, ValueError):
+            return (999999, 999999)
+
     def _record_task(self, key: str, params: dict, status: str, error: str = "", stage: str = ""):
         tasks = self._load_tasks()
         prev = tasks.get(key, {})
@@ -367,7 +378,7 @@ class CloudUploader(_PluginBase):
     def _start_worker(self):
         if self._worker and self._worker.is_alive():
             return
-        self._task_queue = queue.Queue()
+        self._task_queue = queue.PriorityQueue()
         self._worker_stop = False
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker.start()
@@ -376,7 +387,7 @@ class CloudUploader(_PluginBase):
     def _worker_loop(self):
         while not self._worker_stop:
             try:
-                params = self._task_queue.get(timeout=2)
+                _, _, params = self._task_queue.get(timeout=2)
             except queue.Empty:
                 continue
             if params is None:
@@ -510,7 +521,9 @@ class CloudUploader(_PluginBase):
         if record:
             self._record_task(key, params, "pending")
         self._stats["queued"] += 1
-        self._task_queue.put(params)
+        sort_key = self._sort_key(params)
+        self._enqueue_counter += 1
+        self._task_queue.put((sort_key, self._enqueue_counter, params))
         # 在进度列表中标记排队
         if key not in self._task_progress:
             self._task_progress[key] = {
@@ -689,6 +702,13 @@ class CloudUploader(_PluginBase):
         enqueued = self._enqueue(params)
         if not enqueued:
             return {"success": False, "message": "任务已在队列中或入队失败", "filepath": filepath, "tmdb_id": tmdb_id}
+        from .uploader.resolution_key import append_resolution_to_r2_path
+        base_r2 = (
+            f"tmdb/{media_type}/{tmdb_id}/season/{season}/episode/{episode}"
+            if season is not None and episode is not None
+            else f"tmdb/{media_type}/{tmdb_id}"
+        )
+        r2_path, _quality_key = append_resolution_to_r2_path(base_r2, params.get("resolution") or "")
         return {
             "success": True,
             "message": "已入队" + ("（不分片直传）" if mode == "direct" else "（HLS 切片上传）"),
@@ -700,11 +720,7 @@ class CloudUploader(_PluginBase):
             "upload_mode": mode,
             "direct_mp4": mode == "direct",
             "h264_compat": bool(params["h264_compat"]),
-            "r2_path": (
-                f"tmdb/{media_type}/{tmdb_id}/season/{season}/episode/{episode}"
-                if season is not None and episode is not None
-                else f"tmdb/{media_type}/{tmdb_id}"
-            ),
+            "r2_path": r2_path,
         }
 
     def get_service(self) -> List[Dict[str, Any]]:
@@ -1678,6 +1694,6 @@ class CloudUploader(_PluginBase):
         self._worker_stop = True
         if self._task_queue:
             try:
-                self._task_queue.put_nowait(None)
+                self._task_queue.put_nowait(((0, 0), 0, None))
             except Exception:
                 pass

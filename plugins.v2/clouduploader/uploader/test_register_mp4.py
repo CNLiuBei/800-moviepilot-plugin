@@ -36,6 +36,10 @@ class Mp4RegisterTests(unittest.TestCase):
             source_call.kwargs["json"]["url"],
         )
         self.assertEqual("mp4", source_call.kwargs["json"]["sourceType"])
+        self.assertEqual("1080p", source_call.kwargs["json"]["quality"])
+        self.assertEqual("1080p", source_call.kwargs["json"]["label"])
+        self.assertTrue(source_call.kwargs["json"]["replace"])
+        self.assertNotIn("forceReplaceAll", source_call.kwargs["json"])
 
     def test_import_error_keeps_server_message(self):
         response = Mock(status_code=500)
