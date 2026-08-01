@@ -9,22 +9,19 @@ from botocore.config import Config
 
 from .runtime_config import ConfigError, settings
 
-# Slow uplinks (≈0.5 MB/s) need long read timeouts for multipart parts.
+# Slow uplinks need long read timeouts for multipart parts.
 _BOTO_CONFIG = Config(
     proxies={},
     connect_timeout=30,
     read_timeout=900,
     retries={"max_attempts": 8, "mode": "standard"},
-    max_pool_connections=20,
+    max_pool_connections=32,
 )
 
-# Smaller parts + modest concurrency reduce per-part timeout risk on slow links.
-_TRANSFER_CONFIG = TransferConfig(
-    multipart_threshold=8 * 1024 * 1024,
-    multipart_chunksize=8 * 1024 * 1024,
-    max_concurrency=2,
-    use_threads=True,
-)
+# Baseline part size; concurrency comes from settings.UPLOAD_CONCURRENCY
+# (plugin form「上传并发数」), shared with multi-file directory uploads.
+_MULTIPART_CHUNKSIZE = 16 * 1024 * 1024
+_MULTIPART_THRESHOLD = 16 * 1024 * 1024
 
 _MIME_MAP = {
     ".m3u8": "application/vnd.apple.mpegurl",
@@ -62,8 +59,22 @@ def get_s3_client():
 
 
 def get_transfer_config() -> TransferConfig:
-    """Return the shared multipart transfer settings for large R2 uploads."""
-    return _TRANSFER_CONFIG
+    """Multipart settings for large R2 uploads.
+
+    Uses plugin「上传并发数」(settings.UPLOAD_CONCURRENCY) so single-file
+    direct MP4 uploads honor the same knob as multi-file HLS uploads.
+    """
+    try:
+        concurrency = int(settings.UPLOAD_CONCURRENCY)
+    except (TypeError, ValueError):
+        concurrency = 8
+    concurrency = max(1, min(concurrency, 16))
+    return TransferConfig(
+        multipart_threshold=_MULTIPART_THRESHOLD,
+        multipart_chunksize=_MULTIPART_CHUNKSIZE,
+        max_concurrency=concurrency,
+        use_threads=True,
+    )
 
 
 def upload_file_resilient(
@@ -75,7 +86,7 @@ def upload_file_resilient(
     extra_args: dict | None = None,
     callback=None,
 ) -> None:
-    """Upload with long timeouts and conservative multipart settings."""
+    """Upload with long timeouts; concurrency follows UPLOAD_CONCURRENCY."""
     s3.upload_file(
         filename,
         bucket,

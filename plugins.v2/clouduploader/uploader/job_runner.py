@@ -917,6 +917,12 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
 
             if direct_mp4:
                 log("📤 不分片直传 R2 (video.mp4)...")
+                from .r2 import get_transfer_config
+                _xfer = get_transfer_config()
+                log(
+                    f"   分片上传: 并发 {_xfer.max_concurrency}"
+                    f"（表单上传并发数）/ 分片 {_xfer.multipart_chunksize // (1024 * 1024)}MB"
+                )
                 extra_files = []
                 for sub in subtitles:
                     sub_file = sub.get("file")
