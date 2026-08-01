@@ -20,7 +20,7 @@ from threading import Event, Thread
 from urllib.parse import unquote, urlparse
 
 from .runtime_config import settings
-from .env import resolve_tool
+from .env import resolve_tool, resolve_ffmpeg_tools
 from .parser import parse_filename
 from .slicer import apple_hls_slice, get_video_duration
 from .subtitles import resolve_subtitles_for_upload, generate_hls_subtitle_playlists
@@ -32,7 +32,7 @@ from .notify import (
     notify_register_failed,
     notify_register_success,
 )
-from .r2 import get_s3_client, upload_file_resilient, _MIME_MAP
+from .r2 import get_s3_client, upload_concurrency, upload_file_resilient, _MIME_MAP
 from .direct_media import prepare_direct_mp4
 from .upload_policy import direct_mode_enabled
 from .web_playback_check import verify_remote_mp4_web_playable
@@ -135,8 +135,14 @@ def upload_directory_smart(local_dir: Path, r2_prefix: str, on_progress, cancel_
     uploaded_bytes = 0
     completed_files = 0
     start_time = time.time()
+    # File-level parallelism uses the clamped setting. When >1, force serial
+    # multipart parts so we never nest file_pool × part_pool connections.
+    file_workers = upload_concurrency()
+    part_workers = 1 if file_workers > 1 else file_workers
 
     def upload_one(f: Path) -> tuple[str, int]:
+        if cancel_check():
+            raise RuntimeError("上传已取消")
         rel_key = str(f.relative_to(local_dir)).replace("\\", "/")
         local_size = f.stat().st_size
         key = f"{r2_prefix}/{rel_key}"
@@ -147,6 +153,7 @@ def upload_directory_smart(local_dir: Path, r2_prefix: str, on_progress, cancel_
             settings.R2_BUCKET,
             key,
             extra_args={"ContentType": ct},
+            part_concurrency=part_workers,
         )
         return "ok", local_size
 
@@ -154,17 +161,19 @@ def upload_directory_smart(local_dir: Path, r2_prefix: str, on_progress, cancel_
         nonlocal uploaded, failed, uploaded_bytes, completed_files
         if not phase_files:
             return
-        with ThreadPoolExecutor(max_workers=settings.UPLOAD_CONCURRENCY) as pool:
+        with ThreadPoolExecutor(max_workers=file_workers) as pool:
             futs = {pool.submit(upload_one, f): f for f in phase_files}
             for fut in as_completed(futs):
                 if cancel_check():
-                    return
+                    raise RuntimeError("上传已取消")
                 try:
                     r, size = fut.result()
                     uploaded_bytes += size
                     if r == "ok":
                         uploaded += 1
                 except Exception as e:
+                    if "上传已取消" in str(e):
+                        raise
                     failed += 1
                     failed_file = futs[fut]
                     print(f"[upload] 失败: {failed_file.name} - {e}")
@@ -186,10 +195,16 @@ def upload_directory_smart(local_dir: Path, r2_prefix: str, on_progress, cancel_
 
     # Upload manifests last so clients do not see playlists before referenced media is present.
     upload_phase(media_files)
-    if not cancel_check() and failed == 0:
+    if cancel_check():
+        raise RuntimeError("上传已取消")
+    if failed == 0:
         upload_phase(child_manifests)
-    if not cancel_check() and failed == 0:
+    if cancel_check():
+        raise RuntimeError("上传已取消")
+    if failed == 0:
         upload_phase(master_manifests)
+    if cancel_check():
+        raise RuntimeError("上传已取消")
 
     # 有文件上传失败：抛异常让上层 retry；重试会重新覆盖目标前缀，避免半成品残留。
     if failed:
@@ -672,8 +687,7 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
         direct_mp4 = direct_mode_enabled(params)
         if direct_mp4:
             params["skip_slice"] = True
-        ffmpeg = resolve_tool(settings.FFMPEG_BIN)
-        ffprobe = resolve_tool(settings.FFPROBE_BIN)
+        ffmpeg, ffprobe = resolve_ffmpeg_tools()
         if not ffmpeg or not ffprobe:
             msg = (
                 "直传环境未就绪: 重封装需要 ffmpeg/ffprobe"
@@ -704,7 +718,7 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
         try:
             from .resolution_key import quality_key_from_width
             from .slicer import probe_video_info
-            probed = probe_video_info(filepath)
+            probed = probe_video_info(filepath, ffprobe_bin=ffprobe)
             probed_w = int(probed.get("width") or 0)
             if probed_w > 0:
                 width_key = quality_key_from_width(probed_w)
@@ -736,13 +750,11 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
             else:
                 log(f"   ✅ TMDB 元数据可用 ({media_type}/{tmdb_id})")
 
-        if has_episode:
-            r2_path = f"tmdb/{media_type}/{tmdb_id}/season/{int(season)}/episode/{int(episode)}"
-        else:
-            r2_path = f"tmdb/{media_type}/{tmdb_id}"
-        from .resolution_key import append_resolution_to_r2_path
+        from .r2_path import build_quality_r2_path
 
-        r2_path, quality_key = append_resolution_to_r2_path(r2_path, resolution)
+        r2_path, quality_key = build_quality_r2_path(
+            media_type, tmdb_id, resolution or "", season=season, episode=episode
+        )
         resolution = quality_key
         local_output = settings.HLS_OUTPUT_DIR / r2_path
         log(f"📂 R2 路径: {r2_path}/")
@@ -802,6 +814,8 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
                 season=int(season) if season is not None else None,
                 episode=int(episode) if episode is not None else None,
                 opensubtitles=not bool(params.get("no_opensubtitles")),
+                ffmpeg_bin=ffmpeg,
+                ffprobe_bin=ffprobe,
             )
             if subtitles:
                 for sub in subtitles:
@@ -825,6 +839,8 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
                 h264_compat=bool(params.get("h264_compat")),
                 original_language=original_language,
                 print_fn=log,
+                ffmpeg_bin=ffmpeg,
+                ffprobe_bin=ffprobe,
             )
             video_duration = prepared.get("duration") or None
             direct_path = prepared["path"]
@@ -866,6 +882,8 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
                 return apple_hls_slice(
                     filepath, local_output, print_fn=log,
                     original_language=original_language,
+                    ffmpeg_bin=ffmpeg,
+                    ffprobe_bin=ffprobe,
                 )
 
             # 切片失败重试（少量次数，切片多为确定性失败，重试主要应对偶发 I/O）
@@ -891,7 +909,9 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
             log(f"   ✅ CMAF {v_segs} 视频片段, {sz:.2f} GB, {time.time()-start:.1f}s")
             log(f"   编码: {cmaf_result['videoCodec']} + {cmaf_result['audioCodec']}")
             if subtitles and not subtitles_info:
-                subtitles_info = generate_hls_subtitle_playlists(subtitles, local_output, print_fn=log)
+                subtitles_info = generate_hls_subtitle_playlists(
+                    subtitles, local_output, print_fn=log, ffprobe_bin=ffprobe
+                )
             if subtitles_info or not (local_output / "master.m3u8").exists():
                 log("📋 生成 HLS master + DASH MPD...")
                 _generate_manifests(local_output, cmaf_result, log, subtitles_info=subtitles_info)
@@ -917,11 +937,10 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
 
             if direct_mp4:
                 log("📤 不分片直传 R2 (video.mp4)...")
-                from .r2 import get_transfer_config
-                _xfer = get_transfer_config()
+                from .r2 import _MULTIPART_CHUNKSIZE, upload_concurrency
                 log(
-                    f"   分片上传: 并发 {_xfer.max_concurrency}"
-                    f"（表单上传并发数）/ 分片 {_xfer.multipart_chunksize // (1024 * 1024)}MB"
+                    f"   R2 并行 multipart: 并发 {upload_concurrency()}"
+                    f"（表单上传并发数）/ 分片 {_MULTIPART_CHUNKSIZE // (1024 * 1024)}MB"
                 )
                 extra_files = []
                 for sub in subtitles:
@@ -1006,7 +1025,7 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
 
         duration_for_register = int(video_duration) if video_duration else None
         if not duration_for_register and filepath and os.path.isfile(filepath):
-            duration_for_register = get_video_duration(filepath)
+            duration_for_register = get_video_duration(filepath, ffprobe_bin=ffprobe)
 
         # 入库前若已有探测宽度，再次对齐档位
         try:

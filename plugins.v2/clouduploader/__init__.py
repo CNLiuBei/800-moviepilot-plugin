@@ -53,7 +53,7 @@ class CloudUploader(_PluginBase):
     plugin_name = "云端自动上传"
     plugin_desc = "默认 MP4 直传（可选 HLS），整理完成后自动上传 R2 并入库到流媒体站。"
     plugin_icon = "upload.png"
-    plugin_version = "2.9.10"
+    plugin_version = "2.9.11"
     plugin_author = "cn"
     author_url = "https://github.com/CNLiuBei/800-moviepilot-plugin"
     plugin_config_prefix = "clouduploader_"
@@ -710,13 +710,14 @@ class CloudUploader(_PluginBase):
         enqueued = self._enqueue(params)
         if not enqueued:
             return {"success": False, "message": "任务已在队列中或入队失败", "filepath": filepath, "tmdb_id": tmdb_id}
-        from .uploader.resolution_key import append_resolution_to_r2_path
-        base_r2 = (
-            f"tmdb/{media_type}/{tmdb_id}/season/{season}/episode/{episode}"
-            if season is not None and episode is not None
-            else f"tmdb/{media_type}/{tmdb_id}"
+        from .uploader.r2_path import build_quality_r2_path
+        r2_path, _quality_key = build_quality_r2_path(
+            media_type,
+            tmdb_id,
+            params.get("resolution") or "",
+            season=season,
+            episode=episode,
         )
-        r2_path, _quality_key = append_resolution_to_r2_path(base_r2, params.get("resolution") or "")
         return {
             "success": True,
             "message": "已入队" + ("（不分片直传）" if mode == "direct" else "（HLS 切片上传）"),
@@ -812,9 +813,10 @@ class CloudUploader(_PluginBase):
         return roots
 
     def _build_upload_params(self, filepath: str, tmdb_id, media_type: str,
-                             season=None, episode=None, cleanup_roots: Optional[List[str]] = None) -> dict:
+                             season=None, episode=None, cleanup_roots: Optional[List[str]] = None,
+                             resolution: str = "") -> dict:
         """构造上传任务参数，集中处理清理边界等运行期选项。"""
-        return {
+        params = {
             "filepath": filepath,
             "tmdb_id": tmdb_id,
             "media_type": media_type,
@@ -828,6 +830,30 @@ class CloudUploader(_PluginBase):
             "cleanup_roots": cleanup_roots if cleanup_roots is not None else self._cleanup_roots(),
             "cleanup_parent_depth": 2 if _has_episode_numbers(season, episode) else 1,
         }
+        if resolution:
+            params["resolution"] = resolution
+        return params
+
+    def _guess_resolution(self, filepath: str) -> str:
+        """Infer quality key from filename, overridden by ffprobe width when available."""
+        from .uploader.env import resolve_tool
+        from .uploader.parser import parse_filename
+        from .uploader.resolution_key import normalize_quality_key, quality_key_from_width
+
+        info = parse_filename(filepath)
+        resolution = normalize_quality_key(info.get("resolution") or "")
+        try:
+            from .uploader.slicer import probe_video_info
+            ffprobe = resolve_tool(settings.FFPROBE_BIN)
+            probed = probe_video_info(filepath, ffprobe_bin=ffprobe)
+            probed_w = int(probed.get("width") or 0)
+            if probed_w > 0:
+                width_key = quality_key_from_width(probed_w)
+                if width_key != "未知":
+                    return width_key
+        except Exception:
+            pass
+        return "" if resolution == "未知" else resolution
 
     def _start_directory_watch(self):
         """启动 watchdog 实时目录监控。"""
@@ -1090,17 +1116,25 @@ class CloudUploader(_PluginBase):
         if tasks.get(task_key, {}).get("status") == "success":
             return "success"
 
-        # 3c. 检查 R2 标记/播放清单
-        if _has_episode_numbers(season, episode):
-            r2_path = f"tmdb/{media_type}/{tmdb_id}/season/{int(season)}/episode/{int(episode)}"
-        else:
-            r2_path = f"tmdb/{media_type}/{tmdb_id}"
+        # 3c. 检查 R2 标记/播放清单（含分辨率段；兼容旧无分辨率前缀）
+        from .uploader.r2_path import build_media_r2_prefix, marker_lookup_paths
+
+        resolution = self._guess_resolution(filepath) if os.path.isfile(filepath) else ""
+        base_r2 = build_media_r2_prefix(media_type, tmdb_id, season=season, episode=episode)
+        lookup_paths = marker_lookup_paths(base_r2, resolution)
 
         force_overwrite = False
         try:
             from .uploader.r2 import get_s3_client
             s3 = get_s3_client()
-            marker_state = self._r2_upload_marker_state(s3, r2_path)
+            matched_path = None
+            marker_state = "none"
+            for candidate in lookup_paths:
+                marker_state = self._r2_upload_marker_state(s3, candidate)
+                if marker_state != "none":
+                    matched_path = candidate
+                    break
+
             if marker_state == "ready":
                 self._record_task(task_key, {
                     "filepath": filepath, "tmdb_id": tmdb_id,
@@ -1116,24 +1150,39 @@ class CloudUploader(_PluginBase):
                     episode=episode,
                     has_uploaded_marker=True,
                     cleanup_roots=cleanup_roots,
+                    resolution=resolution,
+                    r2_path=matched_path,
                 )
             if marker_state == "uploading":
                 return "uploading"
             if marker_state == "stale_uploading":
-                logger.warning(f"[CloudUploader] 发现超时半成品，按缺失文件补传: {r2_path}")
+                logger.warning(
+                    f"[CloudUploader] 发现超时半成品，按缺失文件补传: {matched_path or base_r2}"
+                )
 
             if not force_overwrite:
                 exists_key = None
-                for media_object in ("master.m3u8", "stream.m3u8", "video.mp4"):
-                    try:
-                        s3.head_object(Bucket=settings.R2_BUCKET, Key=f"{r2_path}/{media_object}")
-                        exists_key = media_object
+                found_path = None
+                for candidate in lookup_paths:
+                    for media_object in ("master.m3u8", "stream.m3u8", "video.mp4"):
+                        try:
+                            s3.head_object(
+                                Bucket=settings.R2_BUCKET,
+                                Key=f"{candidate}/{media_object}",
+                            )
+                            exists_key = media_object
+                            found_path = candidate
+                            break
+                        except Exception:
+                            continue
+                    if exists_key:
                         break
-                    except Exception:
-                        continue
                 if not exists_key:
-                    raise FileNotFoundError(f"{r2_path}/master.m3u8")
-                logger.info(f"[CloudUploader] 发现旧版已上传媒体，补执行入库: {r2_path}/{exists_key}")
+                    raise FileNotFoundError(f"{lookup_paths[0]}/master.m3u8")
+                logger.info(
+                    f"[CloudUploader] 发现旧版已上传媒体，补执行入库: "
+                    f"{found_path}/{exists_key}"
+                )
                 source_hint = (
                     "mp4" if exists_key == "video.mp4"
                     else ("cmaf" if exists_key == "master.m3u8" else "hls")
@@ -1147,6 +1196,8 @@ class CloudUploader(_PluginBase):
                     has_uploaded_marker=False,
                     cleanup_roots=cleanup_roots,
                     source_hint=source_hint,
+                    resolution=resolution,
+                    r2_path=found_path,
                 )
         except Exception:
             pass  # head_object 抛 404 / NoSuchKey 表示不存在，继续入队
@@ -1163,6 +1214,7 @@ class CloudUploader(_PluginBase):
             season=season,
             episode=episode,
             cleanup_roots=cleanup_roots,
+            resolution=resolution,
         )
         if force_overwrite:
             params["force_overwrite"] = True
@@ -1179,8 +1231,12 @@ class CloudUploader(_PluginBase):
                                  season=None, episode=None,
                                  has_uploaded_marker: bool = False,
                                  cleanup_roots: Optional[List[str]] = None,
-                                 source_hint: str = "") -> str:
+                                 source_hint: str = "",
+                                 resolution: str = "",
+                                 r2_path: str = "") -> str:
         """R2 已有完整对象时，只补站点入库，不重复切片/上传。"""
+        if not resolution and os.path.isfile(filepath):
+            resolution = self._guess_resolution(filepath)
         params = self._build_upload_params(
             filepath=filepath,
             tmdb_id=tmdb_id,
@@ -1188,6 +1244,7 @@ class CloudUploader(_PluginBase):
             season=season,
             episode=episode,
             cleanup_roots=cleanup_roots,
+            resolution=resolution,
         )
         params.update({
             "remote_uploaded": True,
@@ -1198,24 +1255,34 @@ class CloudUploader(_PluginBase):
             "clean_after": False,
         })
 
+        from .uploader.r2_path import build_media_r2_prefix, build_quality_r2_path, marker_lookup_paths
+
+        if not r2_path:
+            r2_path, _key = build_quality_r2_path(
+                media_type, tmdb_id, resolution, season=season, episode=episode
+            )
+
         recovery = None
         if has_uploaded_marker:
-            if _has_episode_numbers(season, episode):
-                r2_path = f"tmdb/{media_type}/{tmdb_id}/season/{int(season)}/episode/{int(episode)}"
-            else:
-                r2_path = f"tmdb/{media_type}/{tmdb_id}"
             from .uploader.job_runner import _read_upload_marker
             marker = _read_upload_marker(r2_path, "uploaded", logger.info)
+            if not marker:
+                base = build_media_r2_prefix(
+                    media_type, tmdb_id, season=season, episode=episode
+                )
+                for candidate in marker_lookup_paths(base, resolution):
+                    if candidate == r2_path:
+                        continue
+                    marker = _read_upload_marker(candidate, "uploaded", logger.info)
+                    if marker:
+                        r2_path = candidate
+                        break
             recovery = recovery_policy_from_marker(marker)
         elif source_hint:
             recovery = recovery_policy_from_source_type(source_hint)
         else:
             try:
                 from .uploader.job_runner import _remote_source_type
-                if _has_episode_numbers(season, episode):
-                    r2_path = f"tmdb/{media_type}/{tmdb_id}/season/{int(season)}/episode/{int(episode)}"
-                else:
-                    r2_path = f"tmdb/{media_type}/{tmdb_id}"
                 recovery = recovery_policy_from_source_type(_remote_source_type(r2_path))
             except Exception:
                 recovery = None

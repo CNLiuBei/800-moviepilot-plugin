@@ -9,6 +9,7 @@ import math
 import subprocess
 from pathlib import Path
 
+from .env import resolved_bin
 from .runtime_config import settings
 from .subtitles import _LOW_PRIORITY_LABEL_HINTS, _subtitle_category
 
@@ -30,9 +31,12 @@ _TRANSCODE_TO_AAC_AUDIO_CODECS = frozenset({
 
 def get_video_duration(filepath: str, ffprobe_bin: str | None = None) -> int | None:
     """用 ffprobe 读取视频真实时长, 返回秒数 (整数), 失败返回 None。"""
+    ffprobe = resolved_bin(ffprobe_bin, settings.FFPROBE_BIN)
+    if not ffprobe:
+        return None
     try:
         result = subprocess.run(
-            [ffprobe_bin or settings.FFPROBE_BIN, "-v", "quiet",
+            [ffprobe, "-v", "quiet",
              "-show_entries", "format=duration",
              "-of", "csv=p=0", filepath],
             capture_output=True, text=True, timeout=30,
@@ -47,7 +51,9 @@ def get_video_duration(filepath: str, ffprobe_bin: str | None = None) -> int | N
 
 def probe_video_info(input_path: str, ffprobe_bin: str | None = None) -> dict:
     """用 ffprobe 探测源视频编码、分辨率、码率和时长。"""
-    ffprobe = ffprobe_bin or settings.FFPROBE_BIN
+    ffprobe = resolved_bin(ffprobe_bin, settings.FFPROBE_BIN)
+    if not ffprobe:
+        raise RuntimeError("ffprobe 不可用")
     probe_stream = subprocess.run(
         [ffprobe, "-v", "quiet", "-select_streams", "v:0",
          "-show_entries", "stream=codec_name,profile,level,width,height,bit_rate,avg_frame_rate,r_frame_rate",
@@ -123,8 +129,11 @@ def probe_video_info(input_path: str, ffprobe_bin: str | None = None) -> dict:
 
 def probe_audio_streams(input_path: str, ffprobe_bin: str | None = None) -> list[dict]:
     """探测所有音轨，返回 [{audio_index, lang, title, codec, channels}, ...]。"""
+    ffprobe = resolved_bin(ffprobe_bin, settings.FFPROBE_BIN)
+    if not ffprobe:
+        return []
     result = subprocess.run(
-        [ffprobe_bin or settings.FFPROBE_BIN, "-v", "quiet", "-print_format", "json",
+        [ffprobe, "-v", "quiet", "-print_format", "json",
          "-show_streams", "-select_streams", "a", input_path],
         capture_output=True, text=True, timeout=60,
     )
@@ -322,13 +331,22 @@ def apple_hls_slice(
     output_dir: Path,
     print_fn=None,
     original_language: str | None = None,
+    ffmpeg_bin: str | None = None,
+    ffprobe_bin: str | None = None,
 ) -> dict | None:
     """FFmpeg fMP4 HLS：视频 copy + TMDB 默认音轨，一次性切片为 stream.m3u8。"""
     if print_fn is None:
         print_fn = print
 
+    ffmpeg = resolved_bin(ffmpeg_bin, settings.FFMPEG_BIN)
+    ffprobe = resolved_bin(ffprobe_bin, settings.FFPROBE_BIN)
+    if not ffmpeg or not ffprobe:
+        missing = "ffmpeg" if not ffmpeg else "ffprobe"
+        print_fn(f"   ❌ {missing} 不可用，无法切片")
+        return None
+
     output_dir.mkdir(parents=True, exist_ok=True)
-    probe_info = probe_video_info(input_path)
+    probe_info = probe_video_info(input_path, ffprobe_bin=ffprobe)
     src_codec = probe_info["codec"]
     if src_codec not in _COPYABLE_VIDEO_CODECS:
         print_fn(
@@ -336,7 +354,7 @@ def apple_hls_slice(
         )
         return None
 
-    audio_tracks = probe_audio_streams(input_path)
+    audio_tracks = probe_audio_streams(input_path, ffprobe_bin=ffprobe)
     selected_tracks = select_audio_streams(audio_tracks, original_language, print_fn=print_fn)
     if not selected_tracks:
         print_fn("   ❌ 源文件无可用音轨，无法切片")
@@ -360,11 +378,15 @@ def apple_hls_slice(
     )
 
     cmd = [
-        settings.FFMPEG_BIN, "-i", input_path,
+        ffmpeg, "-i", input_path,
         "-map", "0:v:0", "-map", audio_map,
         "-c:v", "copy",
         "-copyts", "-avoid_negative_ts", "make_zero",
     ]
+    # Apple / VidHub / Infuse 的 HLS 需要 hvc1（参数集进 sample description）。
+    # 仅写 master CODECS=hvc1 而 init 仍是 hev1 时，原生播放器常直接拒播。
+    if src_codec in {"hevc", "h265"}:
+        cmd += ["-tag:v", "hvc1"]
     if _should_transcode_audio_to_aac(codec):
         print_fn(
             f"      音轨: {codec or '?'} → AAC "

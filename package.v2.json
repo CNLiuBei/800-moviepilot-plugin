@@ -1,9 +1,9 @@
 {
   "CloudUploader": {
     "name": "云端自动上传",
-    "description": "默认整文件 MP4 直传（保留 H.265，非 AAC 音轨转 AAC），可选 HLS；慢网上行优化 R2 分片超时。",
+    "description": "默认整文件 MP4 直传（保留 H.265，非 AAC 音轨转 AAC），可选 HLS；R2 大文件按官方低层 multipart+线程池并行上传。",
     "labels": "上传,R2,MP4,HLS,自动化",
-    "version": "2.9.10",
+    "version": "2.9.11",
     "icon": "https://raw.githubusercontent.com/CNLiuBei/800-moviepilot-plugin/main/icons/upload.png",
     "author": "cn",
     "level": 1,

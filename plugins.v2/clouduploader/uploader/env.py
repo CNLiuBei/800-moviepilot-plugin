@@ -84,6 +84,27 @@ def resolve_tool(configured: str) -> str | None:
     return None
 
 
+def resolve_ffmpeg_tools(
+    ffmpeg_bin: str | None = None,
+    ffprobe_bin: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve ffmpeg/ffprobe once for a job (override → settings → PATH)."""
+    ffmpeg = resolve_tool(ffmpeg_bin or settings.FFMPEG_BIN)
+    ffprobe = resolve_tool(ffprobe_bin or settings.FFPROBE_BIN)
+    return ffmpeg, ffprobe
+
+
+def resolved_bin(explicit: str | None, configured: str) -> str | None:
+    """Prefer an explicit bin; fall back to resolve_tool(configured).
+
+    If an explicit value is provided but not found on disk (tests / mocks),
+    keep the explicit string so callers can still invoke a mocked subprocess.
+    """
+    if explicit:
+        return resolve_tool(explicit) or explicit
+    return resolve_tool(configured)
+
+
 def _pip_install_static_ffmpeg(log: LogFn = print) -> bool:
     try:
         import subprocess

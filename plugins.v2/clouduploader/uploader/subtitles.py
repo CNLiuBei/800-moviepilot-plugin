@@ -8,6 +8,7 @@ import re
 import subprocess
 from pathlib import Path
 
+from .env import resolved_bin
 from .runtime_config import settings
 
 _LANG_LABELS = {
@@ -361,12 +362,20 @@ def _hls_media_playlist(output_dir: Path) -> Path | None:
     return None
 
 
-def _probe_hls_media_start(output_dir: Path, print_fn=print) -> float:
+def _probe_hls_media_start(
+    output_dir: Path,
+    print_fn=print,
+    ffprobe_bin: str | None = None,
+) -> float:
     playlist = _hls_media_playlist(output_dir)
     if not playlist:
         return 0.0
+    ffprobe = resolved_bin(ffprobe_bin, settings.FFPROBE_BIN)
+    if not ffprobe:
+        print_fn("   ⚠️ ffprobe 不可用，字幕 MPEGTS 回退 0")
+        return 0.0
     cmd = [
-        settings.FFPROBE_BIN,
+        ffprobe,
         "-v", "quiet",
         "-allowed_extensions", "ALL",
         "-protocol_whitelist", "file,crypto,data",
@@ -495,6 +504,7 @@ def generate_hls_subtitle_playlists(
     subtitles: list[dict],
     output_dir: Path,
     print_fn=None,
+    ffprobe_bin: str | None = None,
 ) -> list[dict]:
     """
     Generate Apple-compatible WebVTT media playlists under subs/<lang>/.
@@ -508,7 +518,9 @@ def generate_hls_subtitle_playlists(
     subtitle_tracks: list[dict] = []
     used_dirs: dict[str, int] = {}
     used_names: dict[str, int] = {}
-    media_start_time = _probe_hls_media_start(output_dir, print_fn=print_fn)
+    media_start_time = _probe_hls_media_start(
+        output_dir, print_fn=print_fn, ffprobe_bin=ffprobe_bin
+    )
     segment_durations = _parse_hls_media_segments(_hls_media_playlist(output_dir) or output_dir / "stream-v.m3u8")
     if segment_durations:
         print_fn(
@@ -665,10 +677,17 @@ def find_external_subtitle_files(video_path: str) -> list[Path]:
     return found
 
 
-def _convert_subtitle_file_to_vtt(src: Path, dest: Path) -> bool:
+def _convert_subtitle_file_to_vtt(
+    src: Path,
+    dest: Path,
+    ffmpeg_bin: str | None = None,
+) -> bool:
     dest.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg = resolved_bin(ffmpeg_bin, settings.FFMPEG_BIN)
+    if not ffmpeg:
+        return False
     cmd = [
-        settings.FFMPEG_BIN, "-y",
+        ffmpeg, "-y",
         "-i", str(src),
         "-c:s", "webvtt",
         str(dest),
@@ -685,6 +704,7 @@ def _load_external_subtitles(
     output_dir: Path,
     print_fn=print,
     original_language: str | None = None,
+    ffmpeg_bin: str | None = None,
 ) -> list[dict]:
     video = Path(video_path)
     files = find_external_subtitle_files(video_path)
@@ -713,7 +733,7 @@ def _load_external_subtitles(
         safe_lang = re.sub(r"[^A-Za-z0-9_-]+", "-", meta["lang"]).strip("-") or "und"
         out_file = f"sub-ext-{index}-{safe_lang}.vtt"
         out_path = output_dir / out_file
-        if not _convert_subtitle_file_to_vtt(src, out_path):
+        if not _convert_subtitle_file_to_vtt(src, out_path, ffmpeg_bin=ffmpeg_bin):
             print_fn(f"   ⚠️ 外挂字幕转换失败: {src.name}")
             continue
         converted.append({
@@ -744,6 +764,8 @@ def resolve_subtitles_for_upload(
     season: int | None = None,
     episode: int | None = None,
     opensubtitles: bool = True,
+    ffmpeg_bin: str | None = None,
+    ffprobe_bin: str | None = None,
 ) -> list[dict]:
     """
     解析上传任务字幕：优先内嵌；内嵌无中文时回退同目录外挂字幕。
@@ -758,6 +780,8 @@ def resolve_subtitles_for_upload(
         output_dir,
         print_fn=print_fn,
         original_language=original_language,
+        ffmpeg_bin=ffmpeg_bin,
+        ffprobe_bin=ffprobe_bin,
     )
     if _has_chinese_subtitle(embedded):
         print_fn("   内嵌字幕已含中文，使用内嵌字幕")
@@ -768,6 +792,7 @@ def resolve_subtitles_for_upload(
         output_dir,
         print_fn=print_fn,
         original_language=original_language,
+        ffmpeg_bin=ffmpeg_bin,
     )
     if not external:
         result = list(embedded)
@@ -821,6 +846,8 @@ def extract_subtitles(
     output_dir: Path,
     print_fn=None,
     original_language: str | None = None,
+    ffmpeg_bin: str | None = None,
+    ffprobe_bin: str | None = None,
 ) -> list[dict]:
     """从 MKV/MP4 提取所有字幕轨 → .vtt 文件。
 
@@ -829,8 +856,14 @@ def extract_subtitles(
     if print_fn is None:
         print_fn = print
 
+    ffprobe = resolved_bin(ffprobe_bin, settings.FFPROBE_BIN)
+    ffmpeg = resolved_bin(ffmpeg_bin, settings.FFMPEG_BIN)
+    if not ffprobe or not ffmpeg:
+        print_fn("   ⚠️ ffmpeg/ffprobe 不可用，跳过字幕提取")
+        return []
+
     probe_cmd = [
-        settings.FFPROBE_BIN, "-v", "quiet", "-print_format", "json",
+        ffprobe, "-v", "quiet", "-print_format", "json",
         "-show_streams", "-select_streams", "s", input_path,
     ]
     result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=60)
@@ -864,7 +897,7 @@ def extract_subtitles(
         out_path = output_dir / out_file
 
         extract_cmd = [
-            settings.FFMPEG_BIN, "-i", input_path,
+            ffmpeg, "-i", input_path,
             "-map", f"0:s:{i}", "-c:s", "webvtt",
             str(out_path), "-y",
         ]

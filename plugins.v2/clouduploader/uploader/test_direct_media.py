@@ -21,8 +21,10 @@ class DirectMediaTests(unittest.TestCase):
 
         self.run_patcher = patch("uploader.direct_media.subprocess.run")
         self.resolve_patcher = patch(
-            "uploader.direct_media.resolve_tool",
-            side_effect=lambda configured: f"/tools/{Path(configured).name}",
+            "uploader.direct_media.resolved_bin",
+            side_effect=lambda explicit, configured: (
+                f"/tools/{Path(explicit or configured).name}"
+            ),
         )
         self.video_patcher = patch(
             "uploader.direct_media.probe_video_info",
@@ -219,7 +221,10 @@ class DirectMediaTests(unittest.TestCase):
 
 
 class DirectMediaProbeTests(unittest.TestCase):
-    @patch("uploader.direct_media.resolve_tool", return_value="/tools/ffprobe")
+    @patch(
+        "uploader.direct_media.resolved_bin",
+        side_effect=lambda explicit, configured: "/tools/ffprobe",
+    )
     @patch("uploader.direct_media.subprocess.run")
     def test_probe_returns_normalized_media_fields(self, run_mock, _resolve_mock):
         run_mock.return_value = subprocess.CompletedProcess(
@@ -252,7 +257,10 @@ class DirectMediaProbeTests(unittest.TestCase):
         self.assertEqual("aac", result["audioCodec"])
         self.assertAlmostEqual(23.976, result["frameRate"], places=3)
 
-    @patch("uploader.direct_media.resolve_tool", return_value="/tools/ffprobe")
+    @patch(
+        "uploader.direct_media.resolved_bin",
+        side_effect=lambda explicit, configured: "/tools/ffprobe",
+    )
     @patch("uploader.direct_media.subprocess.run")
     def test_probe_timeout_is_converted(self, run_mock, _resolve_mock):
         run_mock.side_effect = subprocess.TimeoutExpired(["ffprobe"], 60)

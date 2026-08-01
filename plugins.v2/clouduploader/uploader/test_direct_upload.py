@@ -27,7 +27,7 @@ class DirectUploadTests(unittest.TestCase):
         self.s3 = MagicMock()
         self.s3.delete_objects.return_value = {}
         self.s3.head_object.side_effect = self._head_uploaded_object
-        self.s3.upload_file.side_effect = self._upload_file
+        self.s3.put_object.side_effect = self._put_object
         self.uploaded = {}
 
         self.client_patcher = patch(
@@ -53,15 +53,16 @@ class DirectUploadTests(unittest.TestCase):
         self.web_play_mock = self.web_play_patcher.start()
         self.addCleanup(patch.stopall)
 
-    def _upload_file(self, local_path, _bucket, key, ExtraArgs=None, Callback=None, Config=None):
-        del Config
-        size = Path(local_path).stat().st_size
-        self.uploaded[key] = {
-            "ContentLength": size,
-            "ContentType": (ExtraArgs or {})["ContentType"],
+    def _put_object(self, Bucket, Key, Body, ContentType=None, **_kwargs):
+        del Bucket
+        if hasattr(Body, "read"):
+            data = Body.read()
+        else:
+            data = Body
+        self.uploaded[Key] = {
+            "ContentLength": len(data),
+            "ContentType": ContentType or "application/octet-stream",
         }
-        if Callback:
-            Callback(size)
 
     def _head_uploaded_object(self, Bucket, Key):
         del Bucket
@@ -81,7 +82,7 @@ class DirectUploadTests(unittest.TestCase):
 
         self.assertEqual((0, 0), result)
         self.s3.delete_objects.assert_not_called()
-        self.s3.upload_file.assert_not_called()
+        self.s3.put_object.assert_not_called()
         self.web_play_mock.assert_not_called()
 
     def test_force_overwrite_false_replaces_incomplete_prefix(self):
@@ -105,6 +106,7 @@ class DirectUploadTests(unittest.TestCase):
             },
             {item["Key"] for item in deleted},
         )
+        self.assertIn("tmdb/movie/1/video.mp4", self.uploaded)
         self.web_play_mock.assert_called_once_with(
             self.s3, settings.R2_BUCKET, "tmdb/movie/1/video.mp4"
         )
@@ -122,7 +124,8 @@ class DirectUploadTests(unittest.TestCase):
         )
 
         self.assertEqual((1, 2), result)
-        self.s3.upload_file.assert_called_once()
+        self.s3.put_object.assert_called_once()
+        self.assertIn("tmdb/movie/1/video.mp4", self.uploaded)
 
     def test_remote_video_size_must_match_local_size(self):
         self.s3.head_object.side_effect = lambda **_kwargs: {
@@ -314,7 +317,10 @@ class DirectRunJobTests(unittest.TestCase):
                 patch("uploader.job_runner.settings.HLS_OUTPUT_DIR", self.output_root)
             )
             stack.enter_context(
-                patch("uploader.job_runner.resolve_tool", return_value="/tool")
+                patch(
+                    "uploader.job_runner.resolve_ffmpeg_tools",
+                    return_value=("/tool", "/tool"),
+                )
             )
             stack.enter_context(
                 patch("uploader.job_runner.prepare_direct_mp4", side_effect=prepare)
@@ -370,7 +376,8 @@ class DirectRunJobTests(unittest.TestCase):
         ), patch("uploader.job_runner.settings.validate", return_value=[]), patch(
             "uploader.job_runner.settings.HLS_OUTPUT_DIR", self.output_root
         ), patch(
-            "uploader.job_runner.resolve_tool", return_value="/tool"
+            "uploader.job_runner.resolve_ffmpeg_tools",
+            return_value=("/tool", "/tool"),
         ), patch(
             "uploader.job_runner.prepare_direct_mp4",
             side_effect=prepare,
@@ -401,7 +408,8 @@ class DirectRunJobTests(unittest.TestCase):
 
     def test_direct_mode_requires_both_ffmpeg_and_ffprobe(self):
         with patch("uploader.job_runner.settings.validate", return_value=[]), patch(
-            "uploader.job_runner.resolve_tool", return_value=None
+            "uploader.job_runner.resolve_ffmpeg_tools",
+            return_value=(None, None),
         ), patch("uploader.job_runner.notify_upload_failed") as notify_failed:
             result = run_job(self._params())
 
@@ -491,7 +499,8 @@ class DirectRunJobTests(unittest.TestCase):
             with self.subTest(resolved_tools=resolved_tools), patch(
                 "uploader.job_runner.settings.validate", return_value=[]
             ), patch(
-                "uploader.job_runner.resolve_tool", side_effect=resolved_tools
+                "uploader.job_runner.resolve_ffmpeg_tools",
+                return_value=resolved_tools,
             ) as resolve_mock:
                 result = run_job(self._params())
 
@@ -500,7 +509,7 @@ class DirectRunJobTests(unittest.TestCase):
                 "直传环境未就绪: 重封装需要 ffmpeg/ffprobe",
                 result["error"],
             )
-            self.assertEqual(2, resolve_mock.call_count)
+            resolve_mock.assert_called_once()
 
     def test_skip_register_does_not_write_ready_marker(self):
         marker_calls = []
@@ -529,7 +538,10 @@ class DirectRunJobTests(unittest.TestCase):
                 patch("uploader.job_runner.settings.HLS_OUTPUT_DIR", self.output_root)
             )
             stack.enter_context(
-                patch("uploader.job_runner.resolve_tool", return_value="/tool")
+                patch(
+                    "uploader.job_runner.resolve_ffmpeg_tools",
+                    return_value=("/tool", "/tool"),
+                )
             )
             stack.enter_context(
                 patch("uploader.job_runner.prepare_direct_mp4", side_effect=prepare)
@@ -593,7 +605,7 @@ class HlsDirectoryUploadTests(unittest.TestCase):
 
         self.assertEqual((0, 0), result)
         self.s3.delete_objects.assert_not_called()
-        self.s3.upload_file.assert_not_called()
+        self.s3.put_object.assert_not_called()
 
     def test_force_overwrite_true_replaces_ready_hls_prefix(self):
         self.list_mock.return_value = {
@@ -612,7 +624,43 @@ class HlsDirectoryUploadTests(unittest.TestCase):
 
         self.assertEqual((2, 3), result)
         self.s3.delete_objects.assert_called()
-        self.assertEqual(2, self.s3.upload_file.call_count)
+        self.assertEqual(2, self.s3.put_object.call_count)
+
+    def test_cancel_raises_instead_of_silent_success(self):
+        self.list_mock.return_value = {}
+
+        with self.assertRaisesRegex(RuntimeError, "上传已取消"):
+            upload_directory_smart(
+                self.local,
+                "tmdb/movie/1",
+                self.progress,
+                lambda: True,
+                force_overwrite=True,
+            )
+
+    def test_directory_upload_serializes_multipart_parts_when_files_parallel(self):
+        settings.configure(upload_concurrency=4)
+        self.addCleanup(lambda: settings.configure(upload_concurrency=8))
+        self.list_mock.side_effect = [
+            {},
+            {"master.m3u8": 1, "seg.m4s": 1},
+        ]
+        with patch(
+            "uploader.job_runner.upload_file_resilient"
+        ) as upload_mock:
+            upload_mock.return_value = None
+            result = upload_directory_smart(
+                self.local,
+                "tmdb/movie/1",
+                self.progress,
+                lambda: False,
+                force_overwrite=True,
+            )
+
+        self.assertEqual((2, 0), result)
+        self.assertEqual(2, upload_mock.call_count)
+        for call in upload_mock.call_args_list:
+            self.assertEqual(1, call.kwargs.get("part_concurrency"))
 
 
 if __name__ == "__main__":

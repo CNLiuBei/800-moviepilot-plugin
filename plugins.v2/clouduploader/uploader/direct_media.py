@@ -6,7 +6,7 @@ import json
 import subprocess
 from pathlib import Path
 
-from .env import resolve_tool
+from .env import resolved_bin
 from .runtime_config import settings
 from .slicer import probe_audio_streams, probe_video_info, select_audio_streams
 from .web_playback_check import assert_web_playable
@@ -30,7 +30,7 @@ def _parse_frame_rate(value: object) -> float:
 
 def probe_direct_media(input_path: str, ffprobe_bin: str | None = None) -> dict:
     """Probe container, primary video, and primary audio metadata."""
-    ffprobe = ffprobe_bin or resolve_tool(settings.FFPROBE_BIN)
+    ffprobe = resolved_bin(ffprobe_bin, settings.FFPROBE_BIN)
     if not ffprobe:
         raise RuntimeError("ffprobe 不可用，无法验证直传媒体")
 
@@ -102,10 +102,12 @@ def prepare_direct_mp4(
     h264_compat: bool,
     original_language: str | None,
     print_fn=print,
+    ffmpeg_bin: str | None = None,
+    ffprobe_bin: str | None = None,
 ) -> dict:
     """Remux media to a verified fast-start MP4, transcoding only when needed."""
-    ffmpeg = resolve_tool(settings.FFMPEG_BIN)
-    ffprobe = resolve_tool(settings.FFPROBE_BIN)
+    ffmpeg = resolved_bin(ffmpeg_bin, settings.FFMPEG_BIN)
+    ffprobe = resolved_bin(ffprobe_bin, settings.FFPROBE_BIN)
     if not ffmpeg or not ffprobe:
         missing = "ffmpeg" if not ffmpeg else "ffprobe"
         raise RuntimeError(f"{missing} 不可用，无法准备直传 MP4")
