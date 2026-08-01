@@ -722,7 +722,7 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
             if cancel_check():
                 return {"status": "cancelled", "error": None, "r2_path": None}
             log("🔍 查询 TMDB 元数据...")
-            ok_meta, resolved_type, meta_err = verify_tmdb_metadata(
+            ok_meta, resolved_type, meta_err, meta_warn = verify_tmdb_metadata(
                 int(tmdb_id), media_type, season, episode,
             )
             if not ok_meta:
@@ -731,7 +731,10 @@ def run_job(params: dict, log_fn=None, cancel_check=None) -> dict:
             if resolved_type != media_type:
                 log(f"   ℹ️ 媒体类型修正: {media_type} → {resolved_type}")
                 media_type = resolved_type
-            log(f"   ✅ TMDB 元数据可用 ({media_type}/{tmdb_id})")
+            if meta_warn:
+                log(f"⚠️ {meta_warn}")
+            else:
+                log(f"   ✅ TMDB 元数据可用 ({media_type}/{tmdb_id})")
 
         if has_episode:
             r2_path = f"tmdb/{media_type}/{tmdb_id}/season/{int(season)}/episode/{int(episode)}"

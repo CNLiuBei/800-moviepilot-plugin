@@ -40,11 +40,13 @@ def verify_tmdb_metadata(
     media_type: str = "tv",
     season: int | None = None,
     episode: int | None = None,
-) -> tuple[bool, str, str | None]:
+) -> tuple[bool, str, str | None, str | None]:
     """上传前校验 TMDB 元数据是否可查。
 
     Returns:
-        (ok, resolved_media_type, error_message)
+        (ok, resolved_media_type, error_message, warning_message)
+        - 作品缺失 / 分集查询异常：ok=False，error 有值
+        - 分集在 TMDB 不存在：ok=True，warning 提示按文件名季集继续
     """
     requested = (media_type or "tv").strip().lower()
     if requested not in ("movie", "tv"):
@@ -67,7 +69,7 @@ def verify_tmdb_metadata(
         resolved = alternate
 
     if data is None:
-        return False, requested, f"TMDB 未找到元数据: ID {tmdb_id}"
+        return False, requested, f"TMDB 未找到元数据: ID {tmdb_id}", None
 
     if resolved == "tv" and season is not None and episode is not None:
         try:
@@ -76,11 +78,16 @@ def verify_tmdb_metadata(
                 timeout=10,
             ) or {}
         except Exception as exc:
-            return False, resolved, f"TMDB 分集查询失败 S{int(season)}E{int(episode)}: {exc}"
+            return False, resolved, f"TMDB 分集查询失败 S{int(season)}E{int(episode)}: {exc}", None
         if not ep.get("id"):
-            return False, resolved, f"TMDB 未找到分集: S{int(season)}E{int(episode)}"
+            return (
+                True,
+                resolved,
+                None,
+                f"TMDB 未找到分集: S{int(season)}E{int(episode)}，按文件名季集继续上传",
+            )
 
-    return True, resolved, None
+    return True, resolved, None, None
 
 
 def get_original_language(tmdb_id: int, media_type: str = "tv") -> tuple[str | None, str | None]:
