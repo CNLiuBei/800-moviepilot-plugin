@@ -53,7 +53,7 @@ class CloudUploader(_PluginBase):
     plugin_name = "云端自动上传"
     plugin_desc = "默认 MP4 直传（可选 HLS），整理完成后自动上传 R2 并入库到流媒体站。"
     plugin_icon = "upload.png"
-    plugin_version = "2.9.9"
+    plugin_version = "2.9.10"
     plugin_author = "cn"
     author_url = "https://github.com/CNLiuBei/800-moviepilot-plugin"
     plugin_config_prefix = "clouduploader_"
@@ -261,12 +261,14 @@ class CloudUploader(_PluginBase):
     @staticmethod
     def _sort_key(params: dict) -> tuple:
         """优先级排序键：按 (season, episode) 升序，电影或缺失值排最后。"""
-        season = params.get("season")
-        episode = params.get("episode")
-        try:
-            return (int(season), int(episode))
-        except (TypeError, ValueError):
-            return (999999, 999999)
+        from .uploader.task_queue_order import episode_sort_key_from_params
+        return episode_sort_key_from_params(params)
+
+    @staticmethod
+    def _progress_episode_key(prog: dict, key: str = "") -> tuple:
+        """进度列表排序：优先用记录的季集，否则从文件名解析。"""
+        from .uploader.task_queue_order import episode_sort_key_from_progress
+        return episode_sort_key_from_progress(prog, key)
 
     def _record_task(self, key: str, params: dict, status: str, error: str = "", stage: str = ""):
         tasks = self._load_tasks()
@@ -399,6 +401,7 @@ class CloudUploader(_PluginBase):
 
             # 初始化实时进度
             filename = Path(params.get("filepath", "?")).name
+            sk = self._sort_key(params)
             self._task_progress[key] = {
                 "name": filename,
                 "status": "running",
@@ -406,6 +409,8 @@ class CloudUploader(_PluginBase):
                 "logs": [],
                 "started": int(time.time()),
                 "updated": int(time.time()),
+                "season": sk[0] if sk[0] < 999999 else None,
+                "episode": sk[1] if sk[1] < 999999 else None,
             }
 
             def _progress_log(msg, _key=key):
@@ -526,6 +531,7 @@ class CloudUploader(_PluginBase):
         self._task_queue.put((sort_key, self._enqueue_counter, params))
         # 在进度列表中标记排队
         if key not in self._task_progress:
+            sk = sort_key
             self._task_progress[key] = {
                 "name": Path(params.get("filepath", "?")).name,
                 "status": "pending",
@@ -533,6 +539,8 @@ class CloudUploader(_PluginBase):
                 "logs": [],
                 "started": int(time.time()),
                 "updated": int(time.time()),
+                "season": sk[0] if sk[0] < 999999 else None,
+                "episode": sk[1] if sk[1] < 999999 else None,
             }
         return True
 
@@ -1452,13 +1460,15 @@ class CloudUploader(_PluginBase):
 
         # ─── 构建任务进度列表 ───
         progress_items = []
-        # 先显示运行中的，再显示排队的，最后显示已完成的
+        # 运行中 → 排队（按季集升序）→ 已完成（新近优先）
         sorted_tasks = sorted(
             self._task_progress.items(),
             key=lambda kv: (
                 0 if kv[1].get("status") == "running" else
                 1 if kv[1].get("status") == "pending" else 2,
-                -kv[1].get("updated", 0)
+                self._progress_episode_key(kv[1], kv[0])
+                if kv[1].get("status") in ("running", "pending")
+                else (0, -kv[1].get("updated", 0)),
             )
         )
         for key, prog in sorted_tasks[:30]:  # 最多展示 30 条
